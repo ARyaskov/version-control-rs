@@ -28,21 +28,52 @@ Binary: `vcrs`
 
 ```bash
 vcrs init .
+vcrs checkout http://127.0.0.1:3690/svn/demo ./demo
+vcrs switch http://127.0.0.1:3690/svn/other
+vcrs pull
+vcrs push
+
 vcrs status
+vcrs staged
 vcrs diff
+vcrs diff --path src/main.rs
+vcrs cat src/main.rs@5
+
+vcrs stage src/main.rs README.md
+vcrs unstage README.md
+vcrs stage-all
+vcrs stage-clear
+vcrs hunks src/main.rs
+vcrs stage-hunks src/main.rs 0 2
+vcrs unstage-hunks src/main.rs 2
 vcrs commit -m "message" --author "you"
+vcrs commit -m "message" --author "you" --all
+vcrs commit -m "message" --author "you" --push
 
 vcrs log --limit 20
 vcrs log -r 1:10 -v
+vcrs log -r 1:HEAD --include-merged
 vcrs changed -r 7
+vcrs blame src/main.rs
+vcrs blame src/main.rs -r 7
 
 vcrs update -r HEAD
 vcrs revert [optional/path ...]
 vcrs merge -r 7 [--dry-run] [--record-only]
+vcrs lock path/to/file
+vcrs unlock path/to/file
+vcrs copy src/lib.rs src/lib_copy.rs
+vcrs move src/old.rs src/new.rs
 
 vcrs prop-set --path src/main.rs --name svn:eol-style --value LF
 vcrs prop-get --path src/main.rs --name svn:eol-style
 vcrs prop-del --path src/main.rs --name svn:eol-style
+vcrs iprop-set --scope trunk --name svn:global-ignores --value target
+vcrs iprop-list
+
+vcrs changelist set src/main.rs ui
+vcrs changelist clear src/main.rs
+vcrs changelist list
 
 vcrs ignore add "*.tmp"
 vcrs ignore list
@@ -52,6 +83,40 @@ vcrs externals list
 
 vcrs serve-http --repo . --host 127.0.0.1 --port 3690
 ```
+
+Common aliases:
+
+- `vcrs checkout` -> `vcrs co`
+- `vcrs status` -> `vcrs st`
+- `vcrs diff` -> `vcrs di`
+- `vcrs commit` -> `vcrs ci`
+- `vcrs update` -> `vcrs up`
+
+### Staging workflow
+
+`vcrs` supports an explicit staging area stored in `.vcrs/client-stage-index.json`.
+
+- `stage [paths ...]` stages one or more changed paths
+- `unstage [paths ...]` removes paths from the staging area
+- `stage-all` stages all current changes
+- `stage-clear` clears the staging area completely
+- `staged` shows only staged changes
+- `hunks <path>` lists per-file diff hunks and marks staged ones with `*`
+- `stage-hunks <path> <indices...>` stages selected hunks for a file
+- `unstage-hunks <path> <indices...>` removes selected hunks from the staged set
+- `commit -m ...` commits staged changes by default
+- `commit --all -m ...` bypasses the staging area and commits all working-copy changes
+- `commit --push -m ...` pushes after a successful commit
+
+### Command reference
+
+- Working copy and remotes: `init`, `checkout`, `switch`, `pull`, `push`
+- Local file operations: `copy`, `move`, `revert`, `lock`, `unlock`
+- Inspection: `status`, `staged`, `diff`, `cat`, `log`, `changed`, `blame`, `hunks`
+- History and integration: `commit`, `update`, `merge`
+- Properties and grouping: `prop-set`, `prop-get`, `prop-del`, `iprop-set`, `iprop-list`, `changelist set|clear|list`
+- Metadata rules: `ignore add|list`, `externals set|list`
+- Server mode: `serve-http`
 
 `serve-http` exposes a partial SVN/DAV compatibility layer intended as a foundation.
 Read/discovery/report paths are implemented first; full interoperability with a stock `svn` client
