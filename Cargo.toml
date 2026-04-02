@@ -1,0 +1,41 @@
+﻿[package]
+name = "version-control-rs"
+description = "SVN-like version control engine in Rust (library + CLI)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/ARyaskov/version-control-rs"
+keywords = [
+    "svn",
+    "version-control"
+]
+categories = [
+    "development-tools",
+    "command-line-utilities"
+]
+
+[lib]
+name = "version_control_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vcrs"
+path = "src/main.rs"
+
+[dependencies]
+actix-web = "4.11"
+base64 = "0.22"
+blake3 = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+quick-xml = "0.38"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.10", features = ["v4"] }
+walkdir = "2.5"
+similar = "2.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+diffy = "0.4"
+globset = "0.4"
