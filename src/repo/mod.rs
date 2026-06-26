@@ -7,7 +7,7 @@ use std::process::Command;
 
 use chrono::{DateTime, Utc};
 use diffy::merge as diffy_merge;
-use globset::{Glob, GlobSetBuilder};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use similar::{Algorithm, DiffTag, capture_diff_slices};
 use walkdir::WalkDir;
 
@@ -29,6 +29,13 @@ pub struct Repository {
 pub struct MergeOutcome {
     pub changed: Vec<FileChange>,
     pub conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct GcStats {
+    pub removed: usize,
+    pub kept: usize,
+    pub bytes_freed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,108 +164,234 @@ impl Repository {
         storage::write_blob(self, content)
     }
 
+    /// Sweep blobs in the object store that no commit references. Not safe to
+    /// run concurrently with a commit in progress.
+    pub fn gc(&self) -> Result<GcStats> {
+        let commits_dir = self.root.join(VCRS_DIR).join("commits");
+        let mut referenced: BTreeSet<String> = BTreeSet::new();
+        if commits_dir.exists() {
+            for entry in fs::read_dir(&commits_dir)? {
+                let entry = entry?;
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let commit: Commit = serde_json::from_slice(&fs::read(&p)?)?;
+                for f in &commit.files {
+                    referenced.insert(f.blob_id.clone());
+                }
+            }
+        }
+
+        let objects_dir = self.root.join(VCRS_DIR).join("objects");
+        let mut stats = GcStats::default();
+        if !objects_dir.exists() {
+            return Ok(stats);
+        }
+        for prefix_entry in fs::read_dir(&objects_dir)? {
+            let prefix_path = prefix_entry?.path();
+            if !prefix_path.is_dir() {
+                continue;
+            }
+            let Some(prefix) = prefix_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let prefix = prefix.to_owned();
+            for blob_entry in fs::read_dir(&prefix_path)? {
+                let bp = blob_entry?.path();
+                if !bp.is_file() {
+                    continue;
+                }
+                let Some(rest) = bp.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // Skip our own atomic-write temp files.
+                if rest.ends_with(".tmp") {
+                    continue;
+                }
+                let hash = format!("{prefix}{rest}");
+                if referenced.contains(&hash) {
+                    stats.kept += 1;
+                } else {
+                    let size = fs::metadata(&bp).map(|m| m.len()).unwrap_or(0);
+                    fs::remove_file(&bp)?;
+                    stats.removed += 1;
+                    stats.bytes_freed += size;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
     pub fn read_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
         storage::read_blob(self, blob_id)
     }
 
+    /// Read-only view of the working copy: computes blob ids by hashing without
+    /// writing to the object store. Use this for status/diff/merge planning.
     pub fn snapshot_working_copy(&self) -> Result<Vec<FileEntry>> {
+        self.collect_working(false)
+    }
+
+    /// Like [`snapshot_working_copy`] but persists each file's content as a blob
+    /// in the object store. Use this only when producing a commit.
+    fn materialize_working_copy(&self) -> Result<Vec<FileEntry>> {
+        self.collect_working(true)
+    }
+
+    fn collect_working(&self, persist: bool) -> Result<Vec<FileEntry>> {
         let wcdb = self.wcdb()?;
         let depth = Depth::from_str(&wcdb.depth()?).unwrap_or(Depth::Infinity);
         let ambient = wcdb.ambient_depth_map()?;
-        let ignore_patterns = self.collect_ignore_patterns(&wcdb)?;
-        let externals = wcdb.list_externals()?;
+        let ignore_set = build_ignore_globset(&self.collect_ignore_patterns(&wcdb)?);
         let mut external_paths = BTreeSet::new();
-        for ex in externals {
+        for ex in wcdb.list_externals()? {
             external_paths.insert(ex.path);
         }
+        // One SQL round-trip each instead of two per file.
+        let all_file_props = wcdb.all_file_props()?;
+        let all_inherited = wcdb.all_inherited_props()?;
+        let empty_props = BTreeMap::new();
 
         let mut entries = Vec::new();
+        let root = self.root.clone();
+        let walker = WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(move |e| !is_excluded_toplevel(e.path(), &root));
 
-        for entry in WalkDir::new(&self.root).follow_links(false) {
+        for entry in walker {
             let entry = entry?;
             let path = entry.path();
-
-            if path == self.root.join(VCRS_DIR)
-                || path.starts_with(self.root.join(VCRS_DIR))
-                || path.starts_with(self.root.join(".git"))
-                || path.starts_with(self.root.join("target"))
-            {
+            if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
                 continue;
             }
 
-            if entry.file_type().is_file() || entry.file_type().is_symlink() {
-                let rel = path
-                    .strip_prefix(&self.root)
-                    .map_err(|_| VcsError::PathOutsideRepository(path.display().to_string()))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
+            let rel = path
+                .strip_prefix(&self.root)
+                .map_err(|_| VcsError::PathOutsideRepository(path.display().to_string()))?
+                .to_string_lossy()
+                .replace('\\', "/");
 
-                if should_ignore(&rel, &ignore_patterns) || is_under_external(&rel, &external_paths)
-                {
-                    continue;
-                }
-                if !path_allowed_by_ambient_depth(&rel, depth, &ambient) {
-                    continue;
-                }
-
-                let mut bytes = if entry.file_type().is_symlink() {
-                    let target = fs::read_link(path)?;
-                    format!("link {}", target.to_string_lossy()).into_bytes()
-                } else {
-                    fs::read(path)?
-                };
-                let mut is_binary = is_binary_content(&bytes);
-
-                #[cfg(unix)]
-                let executable = {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::metadata(path)?.permissions().mode() & 0o111 != 0
-                };
-
-                #[cfg(not(unix))]
-                let executable = false;
-
-                let mut props = infer_props(executable, is_binary);
-                if entry.file_type().is_symlink() {
-                    props.insert("svn:special".to_owned(), "*".to_owned());
-                }
-                for (k, v) in wcdb.file_props(&rel)? {
-                    props.insert(k, v);
-                }
-                for (k, v) in wcdb.inherited_props_for_path(&rel)? {
-                    props.entry(k).or_insert(v);
-                }
-                is_binary = effective_is_binary(is_binary, &props);
-                if !is_binary && !has_svn_prop(&props, "svn:special") {
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        bytes = normalize_eol(text, props.get("svn:eol-style")).into_bytes();
-                    }
-                }
-                if has_svn_prop(&props, "svn:keywords")
-                    && !has_svn_prop(&props, "svn:special")
-                    && let Ok(text) = std::str::from_utf8(&bytes)
-                {
-                    bytes = contract_keywords(text, &props).into_bytes();
-                }
-                let blob_id = self.write_blob(&bytes)?;
-
-                entries.push(FileEntry {
-                    path: rel,
-                    blob_id,
-                    executable,
-                    is_binary,
-                    props,
-                    copy_from_path: None,
-                    copy_from_rev: None,
-                    node_id: None,
-                    copy_id: None,
-                    created_rev: None,
-                });
+            if ignore_set.is_match(&rel) || is_under_external(&rel, &external_paths) {
+                continue;
             }
+            if !path_allowed_by_ambient_depth(&rel, depth, &ambient) {
+                continue;
+            }
+
+            let is_symlink = entry.file_type().is_symlink();
+            let raw = if is_symlink {
+                let target = fs::read_link(path)?;
+                format!("link {}", target.to_string_lossy()).into_bytes()
+            } else {
+                fs::read(path)?
+            };
+
+            // A symlink is marked by svn:special; the exec bit on the link
+            // itself (conventionally 0o777) is meaningless, so never infer it.
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                !is_symlink && fs::symlink_metadata(path)?.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = false;
+
+            let file_props = all_file_props.get(&rel).unwrap_or(&empty_props);
+            let inherited = resolve_inherited(&rel, &all_inherited);
+            entries.push(self.finalize_entry(
+                &rel, raw, is_symlink, executable, file_props, &inherited, persist,
+            )?);
         }
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
+    }
+
+    /// Build a single committed file entry from the working copy. `content`
+    /// overrides the on-disk bytes (used for partial-hunk staging); pass `None`
+    /// to read the file. Always persists the resulting blob.
+    fn working_entry(
+        &self,
+        rel: &str,
+        content: Option<Vec<u8>>,
+        persist: bool,
+    ) -> Result<FileEntry> {
+        let abs = rel_to_abs(&self.root, rel);
+        let md = fs::symlink_metadata(&abs)?;
+        let is_symlink = md.file_type().is_symlink();
+        let raw = if is_symlink {
+            let target = fs::read_link(&abs)?;
+            format!("link {}", target.to_string_lossy()).into_bytes()
+        } else {
+            match content {
+                Some(bytes) => bytes,
+                None => fs::read(&abs)?,
+            }
+        };
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            !is_symlink && md.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+
+        let wcdb = self.wcdb()?;
+        let file_props = wcdb.file_props(rel)?;
+        let inherited = wcdb.inherited_props_for_path(rel)?;
+        self.finalize_entry(rel, raw, is_symlink, executable, &file_props, &inherited, persist)
+    }
+
+    fn finalize_entry(
+        &self,
+        rel: &str,
+        raw: Vec<u8>,
+        is_symlink: bool,
+        executable: bool,
+        file_props: &BTreeMap<String, String>,
+        inherited: &BTreeMap<String, String>,
+        persist: bool,
+    ) -> Result<FileEntry> {
+        let (bytes, props, is_binary) = repo_form(raw, is_symlink, file_props, inherited, executable);
+        let blob_id = if persist {
+            self.write_blob(&bytes)?
+        } else {
+            storage::hash_blob(&bytes)
+        };
+        Ok(FileEntry {
+            path: rel.to_owned(),
+            blob_id,
+            executable,
+            is_binary,
+            props,
+            copy_from_path: None,
+            copy_from_rev: None,
+            node_id: None,
+            copy_id: None,
+            created_rev: None,
+        })
+    }
+
+    /// Repository-form (normalized) bytes for a working file, matching exactly
+    /// what the snapshot would store as its blob. Used when a merge needs the
+    /// working content but the snapshot did not persist it.
+    fn normalized_working_bytes(&self, rel: &str) -> Result<Vec<u8>> {
+        let abs = rel_to_abs(&self.root, rel);
+        let md = fs::symlink_metadata(&abs)?;
+        let is_symlink = md.file_type().is_symlink();
+        let raw = if is_symlink {
+            let target = fs::read_link(&abs)?;
+            format!("link {}", target.to_string_lossy()).into_bytes()
+        } else {
+            fs::read(&abs)?
+        };
+        let wcdb = self.wcdb()?;
+        let file_props = wcdb.file_props(rel)?;
+        let inherited = wcdb.inherited_props_for_path(rel)?;
+        let (bytes, _props, _is_binary) = repo_form(raw, is_symlink, &file_props, &inherited, false);
+        Ok(bytes)
     }
 
     pub fn commit(&self, message: &str, author: &str) -> Result<Commit> {
@@ -272,9 +405,23 @@ impl Repository {
         &self,
         message: &str,
         author: &str,
-        mut revprops: BTreeMap<String, String>,
+        revprops: BTreeMap<String, String>,
     ) -> Result<Commit> {
         self.ensure_initialized()?;
+        let snapshot = self.materialize_working_copy()?;
+        self.commit_entries(snapshot, message, author, revprops)
+    }
+
+    /// Commit an explicit, already-persisted set of file entries as the next
+    /// revision. The working copy is never read or mutated here, so staged and
+    /// partial commits cannot lose unstaged work to a crash.
+    fn commit_entries(
+        &self,
+        mut snapshot: Vec<FileEntry>,
+        message: &str,
+        author: &str,
+        mut revprops: BTreeMap<String, String>,
+    ) -> Result<Commit> {
         let wcdb = self.wcdb()?;
 
         let base_rev = wcdb.base_revision()?;
@@ -285,7 +432,6 @@ impl Repository {
         }
 
         let parent = self.head_commit()?;
-        let mut snapshot = self.snapshot_working_copy()?;
         let changed = compute_changed_files(parent.as_ref().map(|c| c.files.as_slice()), &snapshot);
         let parent_revision = parent.as_ref().map(|c| c.revision);
         let pending_merges = if has_pending_merges {
@@ -310,6 +456,24 @@ impl Repository {
                 txn_id: None,
                 changed_paths: Vec::new(),
             }));
+        }
+
+        // Refuse to record unresolved conflict markers (svn blocks this too).
+        let mut conflicted = Vec::new();
+        for ch in &changed {
+            if ch.kind == ChangeKind::Deleted || ch.is_binary || !ch.text_modified {
+                continue;
+            }
+            if let Some(entry) = snapshot.iter().find(|f| f.path == ch.path)
+                && has_conflict_markers(&self.read_blob(&entry.blob_id)?)
+            {
+                conflicted.push(ch.path.clone());
+            }
+        }
+        if !conflicted.is_empty() {
+            return Err(VcsError::UnresolvedConflicts {
+                paths: conflicted.join(", "),
+            });
         }
 
         let parent_id = parent.as_ref().map(|c| c.id.clone());
@@ -340,7 +504,7 @@ impl Repository {
             }
         }
         assign_node_identity(parent.as_ref(), &mut snapshot, next_rev);
-        let changed_paths = build_changed_paths(parent.as_ref(), &snapshot, &changed);
+        let changed_paths = build_changed_paths(parent.as_ref(), &changed);
         let inherited_mergeinfo = parent
             .as_ref()
             .map(|p| p.mergeinfo.clone())
@@ -467,6 +631,44 @@ impl Repository {
         Ok(commit)
     }
 
+    /// Commit only a staged subset without touching the working copy.
+    /// `staged_full` paths take their current working content (or are deleted if
+    /// gone from disk); `staged_partial` maps a path to its partially-applied
+    /// text; every other path keeps its HEAD content.
+    pub fn commit_selective(
+        &self,
+        staged_full: &BTreeSet<String>,
+        staged_partial: &BTreeMap<String, String>,
+        message: &str,
+        author: &str,
+    ) -> Result<Commit> {
+        self.ensure_initialized()?;
+        let head_files = self.head_commit()?.map(|c| c.files).unwrap_or_default();
+        let mut result: BTreeMap<String, FileEntry> =
+            head_files.into_iter().map(|f| (f.path.clone(), f)).collect();
+
+        for path in staged_full {
+            let abs = rel_to_abs(&self.root, path);
+            if fs::symlink_metadata(&abs).is_ok() {
+                result.insert(path.clone(), self.working_entry(path, None, true)?);
+            } else {
+                result.remove(path);
+            }
+        }
+        for (path, text) in staged_partial {
+            result.insert(
+                path.clone(),
+                self.working_entry(path, Some(text.clone().into_bytes()), true)?,
+            );
+        }
+
+        let snapshot: Vec<FileEntry> = result.into_values().collect();
+        let mut revprops = BTreeMap::new();
+        revprops.insert("svn:author".to_owned(), author.to_owned());
+        revprops.insert("svn:log".to_owned(), message.to_owned());
+        self.commit_entries(snapshot, message, author, revprops)
+    }
+
     pub fn log(&self, limit: usize) -> Result<Vec<Commit>> {
         let mut out = Vec::new();
         let mut next = self.head_commit_id()?;
@@ -525,17 +727,10 @@ impl Repository {
     }
 
     pub fn status(&self) -> Result<Vec<FileChange>> {
-        self.sync_wcdb()?;
-        let current = self.snapshot_working_copy()?;
-        let base_rev = self.wcdb()?.base_revision()?;
-        let base_files = if base_rev == 0 {
-            Vec::new()
-        } else {
-            self.read_commit_by_revision(base_rev)
-                .map(|c| c.files)
-                .unwrap_or_default()
-        };
-        Ok(compute_changed_files(Some(&base_files), &current))
+        // Single working-copy scan that both refreshes wc.db and returns the
+        // change set (the old path scanned the tree twice).
+        let working = self.snapshot_working_copy()?;
+        self.sync_wcdb_from(&working)
     }
 
     pub fn revert_to_head(&self, only_paths: &[String]) -> Result<Vec<FileChange>> {
@@ -583,7 +778,8 @@ impl Repository {
         }
         let target_rev = self.resolve_revision_spec(revision)?;
         let target = self.read_commit_by_revision(target_rev)?;
-        let outcome = self.apply_revision_with_conflicts(target_rev, &target.files, None, true)?;
+        let outcome =
+            self.apply_revision_with_conflicts(target_rev, &target.files, None, true, false)?;
         if let Some(d) = depth {
             self.prune_working_to_depth(d)?;
         }
@@ -738,6 +934,13 @@ impl Repository {
         let target = self.read_commit_by_revision(target_rev)?;
 
         if record_only {
+            // A dry run must not persist anything, even with --record-only.
+            if dry_run {
+                return Ok(MergeOutcome {
+                    changed: Vec::new(),
+                    conflicts: Vec::new(),
+                });
+            }
             let mut work = BTreeMap::new();
             work.insert("record-only".to_owned(), target_rev.to_string());
             self.wcdb()?.enqueue_work(&serde_json::to_string(&work)?)?;
@@ -750,11 +953,15 @@ impl Repository {
         }
 
         if dry_run {
-            let status = self.status()?;
-            return Ok(MergeOutcome {
-                changed: status,
-                conflicts: Vec::new(),
-            });
+            // Report what the merge would actually do (incoming ops + conflicts),
+            // not the unrelated local working-copy status.
+            return self.apply_revision_with_conflicts(
+                target_rev,
+                &target.files,
+                scope_path.as_deref(),
+                false,
+                true,
+            );
         }
 
         let outcome = self.apply_revision_with_conflicts(
@@ -762,19 +969,34 @@ impl Repository {
             &target.files,
             scope_path.as_deref(),
             false,
+            false,
         )?;
-        self.wcdb()?
-            .add_pending_merge(scope_path.as_deref().unwrap_or("/"), target_rev)?;
+        // Only record mergeinfo when the merge applied cleanly; a conflicted
+        // merge is not yet integrated and must be resolved + re-evaluated.
+        if outcome.conflicts.is_empty() {
+            self.wcdb()?
+                .add_pending_merge(scope_path.as_deref().unwrap_or("/"), target_rev)?;
+        }
         self.sync_wcdb()?;
         Ok(outcome)
     }
 
     pub fn resolve_revision_spec(&self, spec: &str) -> Result<i64> {
         let wcdb = self.wcdb()?;
-        if spec.eq_ignore_ascii_case("HEAD") {
+        let s = spec.trim();
+        // SVN symbolic revisions. BASE = the revision the working copy is at;
+        // COMMITTED ~= BASE for a whole-tree request; PREV = the revision before
+        // BASE. HEAD = latest committed revision.
+        if s.eq_ignore_ascii_case("HEAD") {
             return wcdb.head_revision();
         }
-        let rev: i64 = spec
+        if s.eq_ignore_ascii_case("BASE") || s.eq_ignore_ascii_case("COMMITTED") {
+            return wcdb.base_revision();
+        }
+        if s.eq_ignore_ascii_case("PREV") {
+            return Ok((wcdb.base_revision()? - 1).max(0));
+        }
+        let rev: i64 = s
             .parse()
             .map_err(|_| VcsError::RevisionNotFound(spec.to_owned()))?;
         if wcdb.commit_for_revision(rev)?.is_none() {
@@ -1164,7 +1386,13 @@ impl Repository {
     }
 
     fn prune_working_to_depth(&self, depth: Depth) -> Result<()> {
-        for entry in WalkDir::new(&self.root).follow_links(false) {
+        let ambient = self.wcdb()?.ambient_depth_map()?;
+        let root = self.root.clone();
+        let walker = WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(move |e| !is_excluded_toplevel(e.path(), &root));
+        for entry in walker {
             let entry = entry?;
             if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
                 continue;
@@ -1175,10 +1403,7 @@ impl Repository {
                 .map_err(|_| VcsError::PathOutsideRepository(entry.path().display().to_string()))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            if rel.starts_with(".vcrs/") || rel.starts_with(".git/") || rel.starts_with("target/") {
-                continue;
-            }
-            if !path_allowed_by_ambient_depth(&rel, depth, &self.wcdb()?.ambient_depth_map()?) {
+            if !path_allowed_by_ambient_depth(&rel, depth, &ambient) {
                 let _ = remove_path_if_exists(entry.path());
             }
         }
@@ -1191,6 +1416,7 @@ impl Repository {
         target_files: &[FileEntry],
         scope_path: Option<&str>,
         advance_base: bool,
+        dry_run: bool,
     ) -> Result<MergeOutcome> {
         let target_meta = self.read_commit_by_revision(rev).ok();
         let wcdb = self.wcdb()?;
@@ -1217,9 +1443,12 @@ impl Repository {
         keys.extend(target_map.keys().copied());
 
         let mut conflicts = Vec::new();
+        let mut planned: Vec<FileChange> = Vec::new();
 
-        wcdb.acquire_lock("", i64::MAX)?;
-        wcdb.clear_conflicts()?;
+        if !dry_run {
+            wcdb.acquire_lock("", i64::MAX)?;
+            wcdb.clear_conflicts()?;
+        }
 
         for path in &keys {
             if let Some(scope) = scope_path {
@@ -1243,11 +1472,19 @@ impl Repository {
 
             if local_changed && changed_entry(w, t) {
                 // conflict
+                if dry_run {
+                    conflicts.push(path.to_string());
+                    planned.push(incoming_change(path, b, t));
+                    continue;
+                }
                 if let (Some(be), Some(we), Some(te)) = (b, w, t) {
                     if !(be.is_binary || we.is_binary || te.is_binary) {
+                        // Working content is not persisted by the snapshot, so
+                        // recompute its repository form from disk.
+                        let working_bytes = self.normalized_working_bytes(path)?;
                         let merged = three_way_merge_text(
                             &String::from_utf8_lossy(&self.read_blob(&be.blob_id)?),
-                            &String::from_utf8_lossy(&self.read_blob(&we.blob_id)?),
+                            &String::from_utf8_lossy(&working_bytes),
                             &String::from_utf8_lossy(&self.read_blob(&te.blob_id)?),
                         );
 
@@ -1258,7 +1495,7 @@ impl Repository {
                         let mine_path = format!("{}.mine", abs.display());
                         let old_path = format!("{}.rOLD", abs.display());
                         let new_path = format!("{}.rNEW", abs.display());
-                        fs::write(&mine_path, self.read_blob(&we.blob_id)?)?;
+                        fs::write(&mine_path, &working_bytes)?;
                         fs::write(&old_path, self.read_blob(&be.blob_id)?)?;
                         fs::write(&new_path, self.read_blob(&te.blob_id)?)?;
                         fs::write(&abs, merged.as_bytes())?;
@@ -1278,6 +1515,10 @@ impl Repository {
             }
 
             // no conflict, apply target state
+            if dry_run {
+                planned.push(incoming_change(path, b, t));
+                continue;
+            }
             match t {
                 Some(te) => {
                     let abs = rel_to_abs(&self.root, path);
@@ -1302,6 +1543,13 @@ impl Repository {
                     }
                 }
             }
+        }
+
+        if dry_run {
+            return Ok(MergeOutcome {
+                changed: planned,
+                conflicts,
+            });
         }
 
         wcdb.release_lock("")?;
@@ -1368,6 +1616,14 @@ impl Repository {
     }
 
     fn sync_wcdb(&self) -> Result<()> {
+        let working = self.snapshot_working_copy()?;
+        self.sync_wcdb_from(&working)?;
+        Ok(())
+    }
+
+    /// Refresh wc.db node/prop tables from an already-computed working snapshot
+    /// and return the change set relative to the base revision.
+    fn sync_wcdb_from(&self, working: &[FileEntry]) -> Result<Vec<FileChange>> {
         let wcdb = self.wcdb()?;
         let base_rev = wcdb.base_revision()?;
         let base_files = if base_rev == 0 {
@@ -1377,10 +1633,10 @@ impl Repository {
                 .map(|c| c.files)
                 .unwrap_or_default()
         };
-        let working = self.snapshot_working_copy()?;
-        let changes = compute_changed_files(Some(&base_files), &working);
-        wcdb.replace_nodes(&base_files, &working, &changes)?;
-        wcdb.replace_file_props_from_entries(&working)
+        let changes = compute_changed_files(Some(&base_files), working);
+        wcdb.replace_nodes(&base_files, working, &changes)?;
+        wcdb.replace_file_props_from_entries(working)?;
+        Ok(changes)
     }
 
     fn collect_ignore_patterns(&self, wcdb: &WcDb) -> Result<Vec<String>> {
@@ -1484,19 +1740,26 @@ pub(crate) fn compute_changed_files(
         }
     }
 
+    // Rename detection: only when the content is unique on BOTH sides (exactly
+    // one add and one delete sharing the blob) and non-empty. Pairing ambiguous
+    // duplicates (e.g. several empty files) produces bogus "moved from" results.
+    let empty = empty_blob_id();
     for (blob_id, add_indices) in &added_by_blob {
-        if let Some(del_indices) = deleted_by_blob.get(blob_id) {
-            let pair_count = add_indices.len().min(del_indices.len());
-            for i in 0..pair_count {
-                let add_idx = add_indices[i];
-                let del_idx = del_indices[i];
-                let from_path = out[del_idx].path.clone();
-                let to_path = out[add_idx].path.clone();
+        if *blob_id == empty {
+            continue;
+        }
+        if let Some(del_indices) = deleted_by_blob.get(blob_id)
+            && add_indices.len() == 1
+            && del_indices.len() == 1
+        {
+            let add_idx = add_indices[0];
+            let del_idx = del_indices[0];
+            let from_path = out[del_idx].path.clone();
+            let to_path = out[add_idx].path.clone();
 
-                out[add_idx].moved_from = Some(from_path.clone());
-                out[add_idx].copy_from = Some(from_path.clone());
-                out[del_idx].moved_to = Some(to_path);
-            }
+            out[add_idx].moved_from = Some(from_path.clone());
+            out[add_idx].copy_from = Some(from_path.clone());
+            out[del_idx].moved_to = Some(to_path);
         }
     }
 
@@ -1508,6 +1771,8 @@ pub(crate) fn compute_changed_files(
             .push(f.path.as_str());
     }
 
+    // Copy detection: only when exactly one surviving base file has the new
+    // file's content (and it is non-empty). Multiple candidates are ambiguous.
     for change in &mut out {
         if change.kind != ChangeKind::Added || change.copy_from.is_some() {
             continue;
@@ -1516,14 +1781,18 @@ pub(crate) fn compute_changed_files(
         let Some(newf) = now_map.get(change.path.as_str()) else {
             continue;
         };
+        if newf.blob_id == empty {
+            continue;
+        }
 
         if let Some(candidates) = base_by_blob.get(newf.blob_id.as_str()) {
-            if let Some(source) = candidates
+            let live: Vec<&str> = candidates
                 .iter()
                 .copied()
-                .find(|p| !deleted_paths.contains(*p) && *p != change.path)
-            {
-                change.copy_from = Some(source.to_owned());
+                .filter(|p| !deleted_paths.contains(*p) && *p != change.path)
+                .collect();
+            if live.len() == 1 {
+                change.copy_from = Some(live[0].to_owned());
             }
         }
     }
@@ -1531,14 +1800,14 @@ pub(crate) fn compute_changed_files(
     out
 }
 
-fn build_changed_paths(
-    parent: Option<&Commit>,
-    snapshot: &[FileEntry],
-    changes: &[FileChange],
-) -> Vec<ChangedPath> {
+/// blake3 hash of empty content — used to exclude trivial/empty files from
+/// rename/copy heuristics.
+fn empty_blob_id() -> String {
+    blake3::hash(&[]).to_hex().to_string()
+}
+
+fn build_changed_paths(parent: Option<&Commit>, changes: &[FileChange]) -> Vec<ChangedPath> {
     let parent_rev = parent.map(|p| p.revision);
-    let snap_map: BTreeMap<&str, &FileEntry> =
-        snapshot.iter().map(|f| (f.path.as_str(), f)).collect();
     let mut out = Vec::new();
     for ch in changes {
         let action = match ch.kind {
@@ -1561,7 +1830,6 @@ fn build_changed_paths(
         let props_modified = ch.props_modified;
         let text_modified = ch.text_modified;
         let path = ch.path.clone();
-        let _entry = snap_map.get(path.as_str()).copied();
         out.push(ChangedPath {
             path,
             action,
@@ -1636,17 +1904,143 @@ fn three_way_merge_text(base: &str, ours: &str, theirs: &str) -> String {
     }
 }
 
-fn should_ignore(path: &str, patterns: &[String]) -> bool {
+/// Describe the incoming change a merge/update would apply for one path (base ->
+/// target), used to report `merge --dry-run` without touching the working copy.
+fn incoming_change(path: &str, b: Option<&FileEntry>, t: Option<&FileEntry>) -> FileChange {
+    let kind = match (b, t) {
+        (None, Some(_)) => ChangeKind::Added,
+        (Some(_), None) => ChangeKind::Deleted,
+        _ => ChangeKind::Modified,
+    };
+    let text_modified = match (b, t) {
+        (Some(bb), Some(tt)) => bb.blob_id != tt.blob_id,
+        _ => true,
+    };
+    let props_modified = match (b, t) {
+        (Some(bb), Some(tt)) => bb.props != tt.props || bb.executable != tt.executable,
+        _ => false,
+    };
+    let is_binary = t.or(b).is_some_and(|e| e.is_binary);
+    FileChange {
+        path: path.to_owned(),
+        kind,
+        text_modified,
+        props_modified,
+        is_binary,
+        copy_from: None,
+        moved_from: None,
+        moved_to: None,
+    }
+}
+
+fn build_ignore_globset(patterns: &[String]) -> GlobSet {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
         if let Ok(glob) = Glob::new(p) {
             builder.add(glob);
         }
     }
-    let Ok(set) = builder.build() else {
+    builder.build().unwrap_or_else(|_| GlobSet::empty())
+}
+
+/// True when the path's top-level component is one we never track, so WalkDir
+/// can prune the whole subtree instead of stat-ing every blob/build artifact.
+fn is_excluded_toplevel(path: &Path, root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
         return false;
     };
-    set.is_match(path)
+    matches!(
+        rel.components().next().and_then(|c| c.as_os_str().to_str()),
+        Some(".vcrs") | Some(".git") | Some("target")
+    )
+}
+
+/// Resolve inherited properties for `path` from the pre-loaded scope map,
+/// shallow scopes first so deeper scopes win (matching `inherited_props_for_path`).
+fn resolve_inherited(
+    path: &str,
+    all_inherited: &BTreeMap<String, BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if all_inherited.is_empty() {
+        return out;
+    }
+    let mut current = String::new();
+    let mut scopes = vec![String::new()];
+    for seg in path.split('/') {
+        if current.is_empty() {
+            current.push_str(seg);
+        } else {
+            current.push('/');
+            current.push_str(seg);
+        }
+        scopes.push(current.clone());
+    }
+    for scope in scopes {
+        if let Some(props) = all_inherited.get(&scope) {
+            for (k, v) in props {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Apply repository-form normalization (eol, keyword contraction, symlink/binary
+/// handling) to raw working bytes, returning the normalized bytes, the effective
+/// property set, and whether the content is treated as binary.
+fn repo_form(
+    mut raw: Vec<u8>,
+    is_symlink: bool,
+    file_props: &BTreeMap<String, String>,
+    inherited: &BTreeMap<String, String>,
+    executable: bool,
+) -> (Vec<u8>, BTreeMap<String, String>, bool) {
+    let detected_binary = is_binary_content(&raw);
+    let mut props = infer_props(executable);
+    if is_symlink {
+        props.insert("svn:special".to_owned(), "*".to_owned());
+    }
+    for (k, v) in file_props {
+        props.insert(k.clone(), v.clone());
+    }
+    for (k, v) in inherited {
+        props.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    let is_binary = effective_is_binary(detected_binary, &props);
+    // Only normalize line endings when svn:eol-style is explicitly set; without
+    // it, content is stored byte-for-byte (svn semantics).
+    if !is_binary
+        && !has_svn_prop(&props, "svn:special")
+        && has_svn_prop(&props, "svn:eol-style")
+        && let Ok(text) = std::str::from_utf8(&raw)
+    {
+        raw = normalize_eol(text, props.get("svn:eol-style")).into_bytes();
+    }
+    if has_svn_prop(&props, "svn:keywords")
+        && !has_svn_prop(&props, "svn:special")
+        && let Ok(text) = std::str::from_utf8(&raw)
+    {
+        raw = contract_keywords(text, &props).into_bytes();
+    }
+    (raw, props, is_binary)
+}
+
+/// Heuristic detection of unresolved SVN conflict markers in committed content.
+fn has_conflict_markers(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut start = false;
+    let mut end = false;
+    for line in text.lines() {
+        if line.starts_with("<<<<<<<") {
+            start = true;
+        } else if line.starts_with(">>>>>>>") {
+            end = true;
+        }
+    }
+    start && end
 }
 
 fn is_under_external(path: &str, external_paths: &BTreeSet<String>) -> bool {
@@ -1655,25 +2049,33 @@ fn is_under_external(path: &str, external_paths: &BTreeSet<String>) -> bool {
         .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
 }
 
+/// Number of leading bytes inspected for binary detection (svn uses a similar
+/// small window rather than scanning whole files).
+const BINARY_SNIFF_LEN: usize = 8192;
+
 fn is_binary_content(bytes: &[u8]) -> bool {
-    if bytes.contains(&0) {
+    let n = bytes.len().min(BINARY_SNIFF_LEN);
+    let window = &bytes[..n];
+    if window.contains(&0) {
         return true;
     }
-    std::str::from_utf8(bytes).is_err()
+    match std::str::from_utf8(window) {
+        Ok(_) => false,
+        // When the file is larger than the window, a None error_len means the
+        // window was cut mid-character — that is a truncation artifact, not a
+        // binary byte, so treat it as text.
+        Err(e) => !(n < bytes.len() && e.error_len().is_none()),
+    }
 }
 
-fn infer_props(executable: bool, is_binary: bool) -> BTreeMap<String, String> {
+/// Auto-derived svn properties. Only `svn:executable` is inferred (matching
+/// svn's add-time behavior); eol-style / mime-type are NOT auto-injected — they
+/// pollute every file's property set and cannot then be removed (the snapshot
+/// would re-add them). Normalization is driven by explicit/inherited props only.
+fn infer_props(executable: bool) -> BTreeMap<String, String> {
     let mut props = BTreeMap::new();
     if executable {
         props.insert("svn:executable".to_owned(), "*".to_owned());
-    }
-    if is_binary {
-        props.insert(
-            "svn:mime-type".to_owned(),
-            "application/octet-stream".to_owned(),
-        );
-    } else {
-        props.insert("svn:eol-style".to_owned(), "native".to_owned());
     }
     props
 }
@@ -1705,6 +2107,7 @@ fn write_entry_to_working(
     let effective_binary = effective_is_binary(entry.is_binary, &entry.props);
     if !effective_binary
         && !has_svn_prop(&entry.props, "svn:special")
+        && has_svn_prop(&entry.props, "svn:eol-style")
         && let Ok(text) = std::str::from_utf8(&out)
     {
         out = apply_eol_style_for_working(text, entry.props.get("svn:eol-style")).into_bytes();

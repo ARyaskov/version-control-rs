@@ -1,10 +1,30 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Result, VcsError};
 use crate::types::{Commit, FileEntry};
 
 use super::{Repository, VCRS_DIR};
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `content` to `path` atomically: write a uniquely-named temp file in the
+/// same directory, then rename it over the destination (an atomic replace on the
+/// same filesystem). Prevents a torn write from corrupting HEAD/commit/blob.
+fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| VcsError::PathOutsideRepository(path.display().to_string()))?;
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".vcrs-tmp-{}-{}.tmp", std::process::id(), n));
+    fs::write(&tmp, content)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(VcsError::Io(e));
+    }
+    Ok(())
+}
 
 fn vcrs(repo: &Repository) -> PathBuf {
     repo.root.join(VCRS_DIR)
@@ -44,7 +64,7 @@ pub fn read_head(repo: &Repository) -> Result<Option<String>> {
 
 pub fn write_head(repo: &Repository, commit_id: &str) -> Result<()> {
     ensure_layout(repo)?;
-    fs::write(head_file(repo), commit_id.as_bytes())?;
+    atomic_write(&head_file(repo), commit_id.as_bytes())?;
     Ok(())
 }
 
@@ -55,15 +75,22 @@ pub fn write_blob(repo: &Repository, content: &[u8]) -> Result<String> {
     let path = dir.join(&hash[2..]);
     fs::create_dir_all(&dir)?;
     if !path.exists() {
-        fs::write(path, content)?;
+        atomic_write(&path, content)?;
     }
     Ok(hash)
+}
+
+/// Content-addressed blob id without touching the object store. Used by the
+/// working-copy snapshot so read-only operations (status/diff/merge planning)
+/// do not litter `.vcrs/objects` with blobs that no commit will ever reference.
+pub fn hash_blob(content: &[u8]) -> String {
+    blake3::hash(content).to_hex().to_string()
 }
 
 pub fn read_blob(repo: &Repository, blob_id: &str) -> Result<Vec<u8>> {
     let path = blob_path(repo, blob_id);
     if !path.exists() {
-        return Err(VcsError::CommitNotFound(format!("blob:{blob_id}")));
+        return Err(VcsError::BlobNotFound(blob_id.to_owned()));
     }
     Ok(fs::read(path)?)
 }
@@ -72,7 +99,7 @@ pub fn write_commit(repo: &Repository, commit: &Commit) -> Result<()> {
     ensure_layout(repo)?;
     let path = commit_path(repo, &commit.id);
     let json = serde_json::to_vec_pretty(commit)?;
-    fs::write(path, json)?;
+    atomic_write(&path, &json)?;
     Ok(())
 }
 

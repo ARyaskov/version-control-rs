@@ -6,14 +6,20 @@ pub enum VcsError {
     RepositoryNotFound,
     #[error("commit '{0}' was not found")]
     CommitNotFound(String),
+    #[error("blob '{0}' was not found in the object store")]
+    BlobNotFound(String),
     #[error("revision '{0}' was not found")]
     RevisionNotFound(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("working copy is out of date: base r{base_rev}, head r{head_rev}")]
     OutOfDate { base_rev: i64, head_rev: i64 },
     #[error("working copy has local modifications; commit/revert before this operation")]
     WorkingCopyDirty,
     #[error("tree conflict at '{path}': {reason}")]
     TreeConflict { path: String, reason: String },
+    #[error("unresolved conflict markers in: {paths}")]
+    UnresolvedConflicts { paths: String },
     #[error("authorization denied for user '{user}' on '{path}' ({action})")]
     AuthzDenied {
         user: String,
@@ -28,6 +34,8 @@ pub enum VcsError {
     NeedsLockRequired { path: String },
     #[error("invalid path outside repository: {0}")]
     PathOutsideRepository(String),
+    #[error("server misconfiguration: {0}")]
+    ServerMisconfigured(String),
     #[error("no staged changes to commit")]
     NoStagedChanges,
     #[error("hunk staging is not supported for path '{path}'")]

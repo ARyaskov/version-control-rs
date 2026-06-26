@@ -7,7 +7,7 @@ use similar::TextDiff;
 use crate::diff::unified_diff;
 use crate::error::{Result, VcsError};
 use crate::ra::{FileRaSession, RaSession, RemoteConfig};
-use crate::repo::{MergeOutcome, Repository};
+use crate::repo::{GcStats, MergeOutcome, Repository};
 use crate::types::{
     BlameLine, ChangeKind, ChangedPath, Commit, Depth, DiffHunk, FileChange, FileEntry,
     RevisionRange,
@@ -41,19 +41,6 @@ impl Default for StageIndex {
 }
 
 #[derive(Debug, Clone)]
-enum FsSnapshot {
-    Missing,
-    File(Vec<u8>),
-    Dir,
-}
-
-#[derive(Debug, Clone)]
-struct PathSnapshot {
-    rel_path: String,
-    state: FsSnapshot,
-}
-
-#[derive(Debug, Clone)]
 struct ComputedHunk {
     index: usize,
     old_start: usize,
@@ -80,6 +67,11 @@ impl Client {
 
     pub fn status(&self) -> Result<Vec<FileChange>> {
         self.repo.status()
+    }
+
+    /// Remove unreferenced blobs from the object store.
+    pub fn gc(&self) -> Result<GcStats> {
+        self.repo.gc()
     }
 
     pub fn commit(&self, message: &str, author: &str) -> Result<Commit> {
@@ -241,7 +233,6 @@ impl Client {
 
         let staged_full: BTreeSet<String> = idx.staged_files.clone();
         let mut staged_partial = BTreeMap::<String, String>::new();
-        let mut partial_paths = BTreeSet::<String>::new();
 
         for (path, hset) in idx.staged_hunks.clone() {
             if staged_full.contains(&path) || hset.is_empty() {
@@ -265,7 +256,6 @@ impl Client {
             let staged_text = apply_selected_hunks(&base, &working, &hunks, &hset);
             if staged_text != base {
                 staged_partial.insert(path.clone(), staged_text);
-                partial_paths.insert(path);
             }
         }
 
@@ -274,39 +264,19 @@ impl Client {
             return Err(VcsError::NoStagedChanges);
         }
 
-        let unstaged_only: Vec<String> = changed_paths
-            .iter()
-            .filter(|p| !staged_full.contains(*p) && !partial_paths.contains(*p))
-            .cloned()
-            .collect();
+        // Build the committed tree from the staged subset without ever mutating
+        // the working copy, so an interruption cannot lose unstaged changes.
+        let commit = self
+            .repo
+            .commit_selective(&staged_full, &staged_partial, message, author)?;
 
-        let mut temp_paths: Vec<String> = unstaged_only;
-        temp_paths.extend(partial_paths.iter().cloned());
-
-        let snapshots = self.capture_paths(&temp_paths)?;
-        if !temp_paths.is_empty() {
-            self.repo.revert_to_head(&temp_paths)?;
+        if push
+            && let Some(cfg) = self.remote_config()?
+        {
+            let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
+            ra.push(&self.repo.root)?;
         }
 
-        for (path, text) in &staged_partial {
-            let abs = self.root().join(path);
-            if let Some(parent) = abs.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(abs, text.as_bytes())?;
-        }
-
-        let commit_result = if push {
-            self.commit_and_push(message, author)
-        } else {
-            self.commit(message, author)
-        };
-
-        if let Err(e) = self.restore_paths(&snapshots) {
-            return Err(VcsError::RestoreFailed(e.to_string()));
-        }
-
-        let commit = commit_result?;
         idx.staged_files.clear();
         idx.staged_hunks.clear();
         self.save_stage_index(&idx)?;
@@ -697,49 +667,6 @@ impl Client {
         Ok((base, working))
     }
 
-    fn capture_paths(&self, paths: &[String]) -> Result<Vec<PathSnapshot>> {
-        let mut out = Vec::with_capacity(paths.len());
-        for rel in paths {
-            let abs = self.root().join(rel);
-            let state = match fs::symlink_metadata(&abs) {
-                Ok(md) => {
-                    if md.is_dir() {
-                        FsSnapshot::Dir
-                    } else {
-                        FsSnapshot::File(fs::read(&abs)?)
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => FsSnapshot::Missing,
-                Err(err) => return Err(VcsError::Io(err)),
-            };
-            out.push(PathSnapshot {
-                rel_path: rel.clone(),
-                state,
-            });
-        }
-        Ok(out)
-    }
-
-    fn restore_paths(&self, snapshots: &[PathSnapshot]) -> Result<()> {
-        for snap in snapshots {
-            let abs = self.root().join(&snap.rel_path);
-            match &snap.state {
-                FsSnapshot::Missing => {
-                    remove_path_if_exists(&abs)?;
-                }
-                FsSnapshot::Dir => {
-                    fs::create_dir_all(&abs)?;
-                }
-                FsSnapshot::File(bytes) => {
-                    if let Some(parent) = abs.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&abs, bytes)?;
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl StageIndex {
@@ -763,21 +690,6 @@ fn ensure_hunk_supported(change: &FileChange) -> Result<()> {
         });
     }
     Ok(())
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(md) => {
-            if md.is_dir() {
-                fs::remove_dir_all(path)?;
-            } else {
-                fs::remove_file(path)?;
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(VcsError::Io(err)),
-    }
 }
 
 fn normalize_rel(path: &str) -> String {
@@ -853,9 +765,15 @@ fn apply_selected_hunks(
         if !selected.contains(&h.index) {
             continue;
         }
-        let start = (h.old_start as isize + offset).max(0) as usize;
-        let end = (h.old_end as isize + offset).max(0) as usize;
-        let replacement: Vec<String> = working_lines[h.new_start..h.new_end].to_vec();
+        // Clamp every index: the working file may have changed since the hunks
+        // were computed, so out-of-range slices must not panic.
+        let len = out_lines.len();
+        let start = ((h.old_start as isize + offset).max(0) as usize).min(len);
+        let end = ((h.old_end as isize + offset).max(0) as usize).clamp(start, len);
+        let replacement: Vec<String> = working_lines
+            .get(h.new_start..h.new_end)
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
         out_lines.splice(start..end, replacement);
         offset +=
             h.new_end as isize - h.new_start as isize - (h.old_end as isize - h.old_start as isize);
@@ -889,7 +807,16 @@ fn parse_peg_path(spec: &str) -> Result<(String, i64)> {
 }
 
 fn is_binary_content(bytes: &[u8]) -> bool {
-    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
+    // Sniff only the leading window (like svn) rather than the whole file.
+    let n = bytes.len().min(8192);
+    let window = &bytes[..n];
+    if window.contains(&0) {
+        return true;
+    }
+    match std::str::from_utf8(window) {
+        Ok(_) => false,
+        Err(e) => !(n < bytes.len() && e.error_len().is_none()),
+    }
 }
 
 fn render_property_diff(

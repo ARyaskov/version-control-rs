@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use version_control_rs::{
@@ -58,6 +59,8 @@ enum Commands {
     Changelist(ChangelistArgs),
     Ignore(IgnoreArgs),
     Externals(ExternalsArgs),
+    Gc,
+    #[cfg(feature = "serve-http")]
     ServeHttp(ServeHttpArgs),
 }
 
@@ -260,6 +263,7 @@ struct ExternalsArgs {
     command: ExternalsCmd,
 }
 
+#[cfg(feature = "serve-http")]
 #[derive(Args, Debug)]
 struct ServeHttpArgs {
     #[arg(long, default_value = ".")]
@@ -465,7 +469,8 @@ fn run(cli: Cli) -> Result<()> {
                     "ok": true,
                     "command": "cat",
                     "peg": args.peg,
-                    "bytes": bytes,
+                    "encoding": "base64",
+                    "content": base64::engine::general_purpose::STANDARD.encode(&bytes),
                 }))?;
             } else {
                 use std::io::Write;
@@ -967,6 +972,25 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Commands::Gc => {
+            let client = Client::discover(".")?;
+            let stats = client.gc()?;
+            if json_output {
+                print_json(json!({
+                    "ok": true,
+                    "command": "gc",
+                    "removed": stats.removed,
+                    "kept": stats.kept,
+                    "bytes_freed": stats.bytes_freed,
+                }))?;
+            } else {
+                println!(
+                    "Removed {} unreferenced blob(s), freed {} bytes ({} kept)",
+                    stats.removed, stats.bytes_freed, stats.kept
+                );
+            }
+        }
+        #[cfg(feature = "serve-http")]
         Commands::ServeHttp(args) => {
             let bind = format!("{}:{}", args.host, args.port);
             if json_output {

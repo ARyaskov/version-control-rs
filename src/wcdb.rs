@@ -1,14 +1,19 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Result;
 use crate::types::{FileChange, FileEntry};
 
-#[derive(Debug, Clone)]
+/// Bump when the schema below changes so existing working copies re-run the
+/// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
+const SCHEMA_VERSION: i64 = 1;
+
+#[derive(Debug)]
 pub struct WcDb {
-    db_path: PathBuf,
+    conn: Connection,
 }
 
 #[derive(Debug, Clone)]
@@ -21,32 +26,39 @@ pub struct ExternalDef {
 impl WcDb {
     pub fn open(repo_root: &Path) -> Result<Self> {
         let db_path = repo_root.join(".vcrs").join("wc.db");
-        let db = Self { db_path };
+        let conn = Connection::open(&db_path)?;
+        // Concurrency / durability tuning. WAL lets readers and a writer coexist,
+        // and busy_timeout avoids spurious "database is locked" errors when the
+        // HTTP server handles overlapping requests against the same wc.db.
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;\n             PRAGMA synchronous = NORMAL;\n             PRAGMA foreign_keys = ON;",
+        )?;
+        let db = Self { conn };
         db.init_schema()?;
         Ok(db)
-    }
-
-    fn connect(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.db_path)?)
     }
 
     fn with_write_tx<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     {
-        let conn = self.connect()?;
-        let tx = conn.unchecked_transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         let out = f(&tx)?;
         tx.commit()?;
         Ok(out)
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute_batch(
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
             r#"
-            BEGIN IMMEDIATE;
-            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS meta (
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
@@ -151,13 +163,14 @@ impl WcDb {
                 depth TEXT NOT NULL,
                 sticky INTEGER NOT NULL DEFAULT 1
             );
-            COMMIT;
             "#,
         )?;
 
         self.set_meta_if_missing("base_revision", "0")?;
         self.set_meta_if_missing("head_revision", "0")?;
         self.set_meta_if_missing("depth", "infinity")?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -204,8 +217,9 @@ impl WcDb {
     }
 
     pub fn ambient_depth_map(&self) -> Result<BTreeMap<String, (String, bool)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT path, depth, sticky FROM ambient_depth")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, depth, sticky FROM ambient_depth")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -226,8 +240,7 @@ impl WcDb {
         working: &[FileEntry],
         changes: &[FileChange],
     ) -> Result<()> {
-        let conn = self.connect()?;
-        let tx = conn.unchecked_transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         let mut stmt = tx.prepare("SELECT path, changelist, inherited_props_json FROM nodes")?;
         let old_rows = stmt.query_map([], |r| {
             Ok((
@@ -388,11 +401,12 @@ impl WcDb {
 
     pub fn dequeue_work(&self) -> Result<Option<String>> {
         self.with_write_tx(|tx| {
-            let mut stmt =
-                tx.prepare("SELECT id, work_json FROM work_queue ORDER BY id LIMIT 1")?;
-            let row: Option<(i64, String)> = stmt
-                .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
+            let row: Option<(i64, String)> = {
+                let mut stmt =
+                    tx.prepare("SELECT id, work_json FROM work_queue ORDER BY id LIMIT 1")?;
+                stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?
+            };
             if let Some((id, work)) = row {
                 tx.execute("DELETE FROM work_queue WHERE id=?1", params![id])?;
                 Ok(Some(work))
@@ -413,8 +427,9 @@ impl WcDb {
     }
 
     pub fn list_ignore_rules(&self) -> Result<Vec<(String, String, bool)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT scope_path, pattern, inherited FROM ignore_rules")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT scope_path, pattern, inherited FROM ignore_rules")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -450,8 +465,7 @@ impl WcDb {
     }
 
     pub fn replace_file_props_from_entries(&self, entries: &[FileEntry]) -> Result<()> {
-        let conn = self.connect()?;
-        let tx = conn.unchecked_transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM file_props", [])?;
         for e in entries {
             for (name, value) in &e.props {
@@ -476,8 +490,9 @@ impl WcDb {
     }
 
     pub fn file_props(&self, path: &str) -> Result<BTreeMap<String, String>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT name, value FROM file_props WHERE path=?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, value FROM file_props WHERE path=?1")?;
         let rows = stmt.query_map(params![path], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -485,6 +500,25 @@ impl WcDb {
         for row in rows {
             let (k, v) = row?;
             out.insert(k, v);
+        }
+        Ok(out)
+    }
+
+    /// Load every per-file property in one query, grouped by path. Used by the
+    /// working-copy snapshot to avoid one SQL round-trip per file.
+    pub fn all_file_props(&self) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+        let mut stmt = self.conn.prepare("SELECT path, name, value FROM file_props")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for row in rows {
+            let (p, n, v) = row?;
+            out.entry(p).or_default().insert(n, v);
         }
         Ok(out)
     }
@@ -500,22 +534,12 @@ impl WcDb {
     }
 
     pub fn inherited_props_for_path(&self, path: &str) -> Result<BTreeMap<String, String>> {
-        let conn = self.connect()?;
+        let scopes = scope_chain(path);
         let mut out = BTreeMap::new();
-        let mut scopes = vec![String::new()];
-        let mut current = String::new();
-        for seg in path.split('/') {
-            if current.is_empty() {
-                current.push_str(seg);
-            } else {
-                current.push('/');
-                current.push_str(seg);
-            }
-            scopes.push(current.clone());
-        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, value FROM inherited_props WHERE scope_path=?1")?;
         for scope in scopes {
-            let mut stmt =
-                conn.prepare("SELECT name, value FROM inherited_props WHERE scope_path=?1")?;
             let rows = stmt.query_map(params![scope], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
@@ -527,9 +551,29 @@ impl WcDb {
         Ok(out)
     }
 
+    /// Load every inherited property in one query, grouped by scope path. The
+    /// snapshot resolves inheritance for each file in-memory from this map.
+    pub fn all_inherited_props(&self) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT scope_path, name, value FROM inherited_props")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for row in rows {
+            let (s, n, v) = row?;
+            out.entry(s).or_default().insert(n, v);
+        }
+        Ok(out)
+    }
+
     pub fn list_inherited_props(&self) -> Result<Vec<(String, String, String)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = self.conn.prepare(
             "SELECT scope_path, name, value FROM inherited_props ORDER BY scope_path, name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -563,8 +607,7 @@ impl WcDb {
     }
 
     pub fn list_changelists(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = self.conn.prepare(
             "SELECT path, changelist FROM nodes WHERE changelist IS NOT NULL ORDER BY changelist, path",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -593,9 +636,9 @@ impl WcDb {
     }
 
     pub fn has_lock_token(&self, path: &str) -> Result<bool> {
-        let conn = self.connect()?;
-        let mut stmt =
-            conn.prepare("SELECT token, owner FROM lock_tokens WHERE path=?1 LIMIT 1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT token, owner FROM lock_tokens WHERE path=?1 LIMIT 1")?;
         let found: Option<(String, Option<String>)> = stmt
             .query_row(params![path], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
@@ -612,9 +655,9 @@ impl WcDb {
     }
 
     pub fn list_externals(&self) -> Result<Vec<ExternalDef>> {
-        let conn = self.connect()?;
-        let mut stmt =
-            conn.prepare("SELECT path, target_url, revision FROM externals ORDER BY path")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, target_url, revision FROM externals ORDER BY path")?;
         let rows = stmt.query_map([], |r| {
             Ok(ExternalDef {
                 path: r.get(0)?,
@@ -740,8 +783,9 @@ impl WcDb {
     }
 
     pub fn merged_revisions_set(&self) -> Result<std::collections::BTreeSet<i64>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT DISTINCT merged_rev FROM merge_edges")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT merged_rev FROM merge_edges")?;
         let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
         let mut out = std::collections::BTreeSet::new();
         for row in rows {
@@ -751,8 +795,7 @@ impl WcDb {
     }
 
     pub fn merge_edges_up_to(&self, max_target_rev: i64) -> Result<Vec<(i64, i64, String)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = self.conn.prepare(
             "SELECT target_rev, merged_rev, source_path
              FROM merge_edges
              WHERE target_rev<=?1
@@ -783,8 +826,7 @@ impl WcDb {
     }
 
     pub fn pending_merges(&self) -> Result<Vec<(String, i64)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = self.conn.prepare(
             "SELECT source_path, merged_rev FROM pending_merges ORDER BY source_path, merged_rev",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
@@ -797,22 +839,27 @@ impl WcDb {
 
     pub fn take_pending_merges(&self) -> Result<Vec<(String, i64)>> {
         self.with_write_tx(|tx| {
-            let mut stmt = tx.prepare(
-                "SELECT source_path, merged_rev FROM pending_merges ORDER BY source_path, merged_rev",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
+            let out = {
+                let mut stmt = tx.prepare(
+                    "SELECT source_path, merged_rev FROM pending_merges ORDER BY source_path, merged_rev",
+                )?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                out
+            };
             tx.execute("DELETE FROM pending_merges", [])?;
             Ok(out)
         })
     }
 
     pub fn revision_for_commit(&self, commit_id: &str) -> Result<Option<i64>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT rev FROM revisions WHERE commit_id=?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rev FROM revisions WHERE commit_id=?1")?;
         let rev = stmt
             .query_row(params![commit_id], |r| r.get(0))
             .optional()?;
@@ -820,22 +867,23 @@ impl WcDb {
     }
 
     pub fn commit_for_revision(&self, rev: i64) -> Result<Option<String>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT commit_id FROM revisions WHERE rev=?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT commit_id FROM revisions WHERE rev=?1")?;
         let id = stmt.query_row(params![rev], |r| r.get(0)).optional()?;
         Ok(id)
     }
 
     pub fn max_revision(&self) -> Result<i64> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT COALESCE(MAX(rev), 0) FROM revisions")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COALESCE(MAX(rev), 0) FROM revisions")?;
         let max: i64 = stmt.query_row([], |r| r.get(0))?;
         Ok(max)
     }
 
     fn meta(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT v FROM meta WHERE k=?1")?;
+        let mut stmt = self.conn.prepare("SELECT v FROM meta WHERE k=?1")?;
         let value = stmt.query_row(params![key], |r| r.get(0)).optional()?;
         Ok(value)
     }
@@ -860,4 +908,21 @@ impl WcDb {
             Ok(())
         })
     }
+}
+
+/// All scope prefixes that apply to `path`, from the repository root ("") down
+/// to the file's immediate parent, in inheritance order (shallow first).
+fn scope_chain(path: &str) -> Vec<String> {
+    let mut scopes = vec![String::new()];
+    let mut current = String::new();
+    for seg in path.split('/') {
+        if current.is_empty() {
+            current.push_str(seg);
+        } else {
+            current.push('/');
+            current.push_str(seg);
+        }
+        scopes.push(current.clone());
+    }
+    scopes
 }

@@ -1,11 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use actix_web::http::{StatusCode, header};
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
 use base64::Engine;
+use flate2::read::ZlibDecoder;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use uuid::Uuid;
@@ -14,10 +16,22 @@ use crate::client::Client;
 use crate::error::{Result, VcsError};
 use crate::types::ChangedPathAction;
 
+/// Cap on concurrently open commit activities (abandoned MKACTIVITY sessions
+/// would otherwise leak memory indefinitely).
+const MAX_ACTIVITIES: usize = 256;
+/// Cap on bytes buffered in a single activity before it is committed. Bounds the
+/// memory a client can pin with PUT requests.
+const MAX_ACTIVITY_BYTES: usize = 128 * 1024 * 1024;
+/// HTTP Basic auth realm advertised when a password file is configured.
+const AUTH_REALM: &str = "vcrs";
+
 #[derive(Debug)]
 struct AppState {
     repo_root: PathBuf,
     activities: Mutex<HashMap<String, TxnActivity>>,
+    /// Serializes commit application so overlapping MERGE requests cannot
+    /// interleave writes to the shared working copy.
+    commit_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -26,16 +40,26 @@ struct TxnActivity {
     log_message: Option<String>,
     files: BTreeMap<String, Vec<u8>>,
     props: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    deletes: BTreeSet<String>,
 }
 
 pub fn serve_http(repo_root: PathBuf, bind: &str) -> Result<()> {
     if !repo_root.join(".vcrs").exists() {
         return Err(VcsError::RepositoryNotFound);
     }
+    // authz keyed on a spoofable identity is meaningless without authentication.
+    // Refuse to start in that trap (authz.json present, passwd.json absent).
+    let vcrs = repo_root.join(".vcrs");
+    if vcrs.join("authz.json").exists() && !vcrs.join("passwd.json").exists() {
+        return Err(VcsError::ServerMisconfigured(
+            "authz.json requires passwd.json: authorization rules are unenforceable without authentication".to_owned(),
+        ));
+    }
 
     let data = web::Data::new(AppState {
         repo_root,
         activities: Mutex::new(HashMap::new()),
+        commit_lock: Mutex::new(()),
     });
 
     actix_web::rt::System::new()
@@ -43,6 +67,9 @@ pub fn serve_http(repo_root: PathBuf, bind: &str) -> Result<()> {
             HttpServer::new(move || {
                 App::new()
                     .app_data(data.clone())
+                    // Allow request bodies up to the per-activity cap; the
+                    // activity accounting bounds total buffered memory.
+                    .app_data(web::PayloadConfig::new(MAX_ACTIVITY_BYTES))
                     .route("/{tail:.*}", web::to(svn_entry))
             })
             .bind(bind)?
@@ -55,12 +82,14 @@ pub fn serve_http(repo_root: PathBuf, bind: &str) -> Result<()> {
 async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState>) -> HttpResponse {
     let method = req.method().as_str().to_owned();
     let path = req.path().to_owned();
-    let username = req
-        .headers()
-        .get("SVN-UserName")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_owned();
+
+    // Authenticate before doing anything else. When a password file is present
+    // the request must carry valid Basic credentials; otherwise access is
+    // anonymous (the absence of the file is the operator's opt-in to open access).
+    let username = match authenticate(&state.repo_root, &req) {
+        Ok(user) => user,
+        Err(resp) => return resp,
+    };
 
     if let Some(action) = method_action(&method) {
         let authz_path = authz_check_path(&path);
@@ -86,7 +115,7 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
             .insert_header(("MS-Author-Via", "DAV"))
             .insert_header((
                 header::ALLOW,
-                "OPTIONS, PROPFIND, REPORT, CHECKOUT, MERGE, MKACTIVITY, PROPPATCH, PUT, LOCK, UNLOCK, GET, HEAD",
+                "OPTIONS, PROPFIND, REPORT, CHECKOUT, MERGE, MKACTIVITY, PROPPATCH, PUT, DELETE, LOCK, UNLOCK, GET, HEAD",
             ))
             .finish(),
         "PROPFIND" => {
@@ -121,17 +150,15 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         }
         "MKACTIVITY" => {
             let id = Uuid::new_v4().to_string();
-            let author = req
-                .headers()
-                .get("SVN-UserName")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("anonymous")
-                .to_owned();
             let activity = TxnActivity {
-                author,
+                author: username.clone(),
                 ..TxnActivity::default()
             };
             if let Ok(mut map) = state.activities.lock() {
+                if map.len() >= MAX_ACTIVITIES {
+                    return HttpResponse::ServiceUnavailable()
+                        .body("too many open activities");
+                }
                 map.insert(id.clone(), activity);
             }
             HttpResponse::Created()
@@ -141,14 +168,14 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         "CHECKOUT" => {
             let activity_href = parse_first_tag_text(&body, "href");
             let Some(activity_id) = extract_activity_id(activity_href.as_deref().unwrap_or("")) else {
-                return svn_error_response(VcsError::RevisionNotFound(
+                return svn_error_response(VcsError::Protocol(
                     "missing activity-set href".to_owned(),
                 ));
             };
             if let Ok(map) = state.activities.lock()
                 && !map.contains_key(&activity_id)
             {
-                return svn_error_response(VcsError::RevisionNotFound("unknown activity".to_owned()));
+                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
             }
             HttpResponse::Created()
                 .insert_header(("Location", format!("/!svn/wrk/{activity_id}/")))
@@ -172,8 +199,20 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                 }
             };
             let Some(activity) = map.get_mut(&activity_id) else {
-                return svn_error_response(VcsError::RevisionNotFound("unknown activity".to_owned()));
+                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
             };
+
+            // Bound the memory a single activity can pin across PUTs. Compute
+            // the remaining budget up front so the svndiff expansion below is
+            // capped *before* it allocates (the declared target length is
+            // attacker-controlled).
+            let buffered: usize = activity
+                .files
+                .iter()
+                .filter(|(k, _)| *k != &rel)
+                .map(|(_, v)| v.len())
+                .sum();
+            let remaining = MAX_ACTIVITY_BYTES.saturating_sub(buffered);
 
             let ctype = req
                 .headers()
@@ -182,13 +221,18 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                 .unwrap_or_default();
             let data = if ctype.contains("svndiff") {
                 let base = load_head_file_bytes(&state.repo_root, &rel).unwrap_or_default();
-                match apply_svndiff_stream(&base, &body) {
+                match apply_svndiff_stream(&base, &body, remaining) {
                     Ok(v) => v,
                     Err(err) => return svn_error_response(err),
                 }
             } else {
                 body.to_vec()
             };
+            if data.len() > remaining {
+                return HttpResponse::PayloadTooLarge().body("activity byte limit exceeded");
+            }
+            // A PUT supersedes a pending delete for the same path (SVN replace).
+            activity.deletes.remove(&rel);
             activity.files.insert(rel, data);
             HttpResponse::Created().finish()
         }
@@ -211,8 +255,10 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                 }
             };
             let Some(activity) = map.get_mut(&activity_id) else {
-                return svn_error_response(VcsError::RevisionNotFound("unknown activity".to_owned()));
+                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
             };
+            // Setting properties supersedes a pending delete for the same path.
+            activity.deletes.remove(&rel);
             let entry = activity.props.entry(rel).or_default();
             for (k, v) in ops {
                 entry.insert(k, v);
@@ -226,7 +272,7 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         "MERGE" => {
             let activity_href = parse_first_tag_text(&body, "href");
             let Some(activity_id) = extract_activity_id(activity_href.as_deref().unwrap_or("")) else {
-                return svn_error_response(VcsError::RevisionNotFound("missing source href".to_owned()));
+                return svn_error_response(VcsError::Protocol("missing source href".to_owned()));
             };
             let log_msg = parse_first_tag_text(&body, "log-message")
                 .or_else(|| req.headers().get("SVN-Log").and_then(|v| v.to_str().ok()).map(str::to_owned));
@@ -240,15 +286,55 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                 map.remove(&activity_id)
             };
             let Some(activity) = activity else {
-                return svn_error_response(VcsError::RevisionNotFound("unknown activity".to_owned()));
+                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
             };
-            match apply_activity_commit(&state.repo_root, activity, log_msg) {
-                Ok(rev) => HttpResponse::Ok()
+            // Apply the commit on a blocking thread, serialized against other
+            // commits so concurrent MERGEs cannot interleave working-copy writes.
+            let state = state.clone();
+            let repo_root = state.repo_root.clone();
+            let outcome = web::block(move || {
+                let _guard = state
+                    .commit_lock
+                    .lock()
+                    .map_err(|_| VcsError::RepositoryNotFound)?;
+                apply_activity_commit(&repo_root, activity, log_msg)
+            })
+            .await;
+            match outcome {
+                Ok(Ok(rev)) => HttpResponse::Ok()
                     .insert_header((header::CONTENT_TYPE, "text/xml; charset=\"utf-8\""))
                     .insert_header(("SVN-Youngest-Rev", rev.to_string()))
                     .body(merge_ok_xml(rev)),
-                Err(err) => svn_error_response(err),
+                Ok(Err(err)) => svn_error_response(err),
+                Err(_) => {
+                    HttpResponse::InternalServerError().body("commit task canceled")
+                }
             }
+        }
+        "DELETE" => {
+            let Some((activity_id, rel_path)) = parse_wrk_path(&path) else {
+                return svn_error_response(VcsError::PathOutsideRepository(
+                    "expected /!svn/wrk/<activity>/<path>".to_owned(),
+                ));
+            };
+            let rel = match sanitize_repo_rel(rel_path) {
+                Ok(v) => v,
+                Err(e) => return svn_error_response(e),
+            };
+            let mut map = match state.activities.lock() {
+                Ok(m) => m,
+                Err(_) => {
+                    return HttpResponse::InternalServerError().body("activity lock poisoned")
+                }
+            };
+            let Some(activity) = map.get_mut(&activity_id) else {
+                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
+            };
+            // A delete supersedes any pending PUT/PROPPATCH for the same path.
+            activity.files.remove(&rel);
+            activity.props.remove(&rel);
+            activity.deletes.insert(rel);
+            HttpResponse::NoContent().finish()
         }
         "LOCK" => {
             let rel = match sanitize_repo_rel(path.trim_start_matches('/')) {
@@ -354,6 +440,19 @@ fn apply_activity_commit(
         }
         std::fs::write(abs, bytes)?;
     }
+    for rel in &activity.deletes {
+        // A path re-added in the same activity must not be deleted.
+        if activity.files.contains_key(rel) {
+            continue;
+        }
+        let abs = join_repo_path(repo_root, rel)?;
+        match std::fs::symlink_metadata(&abs) {
+            Ok(md) if md.is_dir() => std::fs::remove_dir_all(&abs)?,
+            Ok(_) => std::fs::remove_file(&abs)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(VcsError::Io(e)),
+        }
+    }
     for (rel, props) in &activity.props {
         for (name, value) in props {
             match value {
@@ -378,9 +477,8 @@ fn apply_activity_commit(
 fn method_action(method: &str) -> Option<Action> {
     match method {
         "GET" | "HEAD" | "PROPFIND" | "REPORT" | "OPTIONS" => Some(Action::Read),
-        "MKACTIVITY" | "CHECKOUT" | "PUT" | "PROPPATCH" | "MERGE" | "LOCK" | "UNLOCK" => {
-            Some(Action::Write)
-        }
+        "MKACTIVITY" | "CHECKOUT" | "PUT" | "PROPPATCH" | "MERGE" | "DELETE" | "LOCK"
+        | "UNLOCK" => Some(Action::Write),
         _ => None,
     }
 }
@@ -390,6 +488,83 @@ fn authz_check_path(req_path: &str) -> String {
         return "/".to_owned();
     }
     format!("/{}", req_path.trim_start_matches('/'))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct PasswdFile {
+    /// Map of username -> password (svnserve-style plaintext passwd file).
+    #[serde(default)]
+    users: BTreeMap<String, String>,
+}
+
+/// Resolve the request's authenticated username. If `.vcrs/passwd.json` exists,
+/// valid HTTP Basic credentials are required and the Basic username is used
+/// (the spoofable `SVN-UserName` header is ignored). Without a passwd file,
+/// access is anonymous.
+fn authenticate(
+    repo_root: &Path,
+    req: &HttpRequest,
+) -> std::result::Result<String, HttpResponse> {
+    let passwd_path = repo_root.join(".vcrs").join("passwd.json");
+    if !passwd_path.exists() {
+        let user = req
+            .headers()
+            .get("SVN-UserName")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("anonymous")
+            .to_owned();
+        return Ok(user);
+    }
+
+    let passwd = match load_passwd(&passwd_path) {
+        Ok(p) => p,
+        Err(_) => return Err(HttpResponse::InternalServerError().body("invalid passwd file")),
+    };
+    let Some((user, pass)) = parse_basic_auth(req) else {
+        return Err(auth_challenge());
+    };
+    match passwd.users.get(&user) {
+        Some(expected) if constant_time_eq(expected.as_bytes(), pass.as_bytes()) => Ok(user),
+        _ => Err(auth_challenge()),
+    }
+}
+
+fn auth_challenge() -> HttpResponse {
+    HttpResponse::Unauthorized()
+        .insert_header(("WWW-Authenticate", format!("Basic realm=\"{AUTH_REALM}\"")))
+        .body("authentication required")
+}
+
+fn parse_basic_auth(req: &HttpRequest) -> Option<(String, String)> {
+    let header = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let b64 = header
+        .strip_prefix("Basic ")
+        .or_else(|| header.strip_prefix("basic "))?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_owned(), pass.to_owned()))
+}
+
+fn load_passwd(path: &Path) -> Result<PasswdFile> {
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Length-aware constant-time byte comparison for password checks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -467,31 +642,66 @@ fn save_locks(path: &Path, locks: &BTreeMap<String, String>) -> Result<()> {
 }
 
 fn join_repo_path(repo_root: &Path, rel: &str) -> Result<PathBuf> {
+    use std::path::Component;
     let mut out = repo_root.to_path_buf();
     for part in rel.split('/') {
         if part.is_empty() || part == "." {
             continue;
         }
-        if part == ".." {
-            return Err(VcsError::PathOutsideRepository(rel.to_owned()));
+        // Defense in depth: only push plain filename components. This rejects
+        // "..", drive prefixes ("C:"), root/UNC prefixes, etc. — anything that
+        // PathBuf::push would treat as absolute and use to escape repo_root.
+        let mut comps = Path::new(part).components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(_)), None) => out.push(part),
+            _ => return Err(VcsError::PathOutsideRepository(rel.to_owned())),
         }
-        out.push(part);
     }
     Ok(out)
 }
 
 fn sanitize_repo_rel(input: &str) -> Result<String> {
-    let norm = input.trim().trim_matches('/').replace('\\', "/");
+    // URL-decode first so percent-encoded paths (e.g. "my%20file.txt") map to
+    // the real filename, and so "%2e%2e" / "%3a" cannot smuggle ".." or a drive
+    // letter past the checks.
+    let decoded = percent_decode(input);
+    let norm = decoded.trim().trim_matches('/').replace('\\', "/");
     if norm.is_empty() {
         return Err(VcsError::PathOutsideRepository(input.to_owned()));
     }
     if norm.starts_with(".vcrs") || norm.starts_with("!svn") {
         return Err(VcsError::PathOutsideRepository(input.to_owned()));
     }
-    if norm.split('/').any(|p| p == "..") {
+    // Reject "..", and any ':' (Windows drive prefix like "C:" / "C:foo" or an
+    // NTFS alternate-data-stream) — on Windows PathBuf::push of a drive-prefixed
+    // component silently discards the repo root and escapes the sandbox.
+    if norm.split('/').any(|p| p == ".." || p.contains(':')) {
         return Err(VcsError::PathOutsideRepository(input.to_owned()));
     }
     Ok(norm)
+}
+
+/// Decode `%XX` escapes in a URL path segment. `+` is left literal (it only
+/// means space in query strings, not path components). Invalid escapes are
+/// passed through unchanged.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_wrk_path(path: &str) -> Option<(String, &str)> {
@@ -622,23 +832,30 @@ fn parse_proppatch(xml: &[u8]) -> Vec<(String, Option<String>)> {
     out
 }
 
+/// Parse the client's reported base revision from an update-report request.
+/// A mixed-revision working copy sends one `<S:entry rev="N">` per path; we take
+/// the LOWEST so the response includes every delta any path might still need
+/// (over-sending is harmless — the client ignores deltas it already has).
 fn parse_update_target_rev(xml: &[u8]) -> Option<i64> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
+    let mut min_rev: Option<i64> = None;
+    let mut record = |num: i64| {
+        min_rev = Some(min_rev.map_or(num, |cur| cur.min(num)));
+    };
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let local = local_name(e.name().as_ref()).to_owned();
                 if local == "target-revision" || local == "entry" {
                     for attr in e.attributes().flatten() {
                         let k = local_name(attr.key.as_ref());
-                        if k == "rev" || k == "revision" {
-                            if let Ok(v) = std::str::from_utf8(attr.value.as_ref())
-                                && let Ok(num) = v.parse::<i64>()
-                            {
-                                return Some(num);
-                            }
+                        if (k == "rev" || k == "revision")
+                            && let Ok(v) = std::str::from_utf8(attr.value.as_ref())
+                            && let Ok(num) = v.parse::<i64>()
+                        {
+                            record(num);
                         }
                     }
                 }
@@ -649,7 +866,7 @@ fn parse_update_target_rev(xml: &[u8]) -> Option<i64> {
         }
         buf.clear();
     }
-    None
+    min_rev
 }
 
 fn load_head_file_bytes(repo_root: &Path, rel: &str) -> Option<Vec<u8>> {
@@ -680,7 +897,7 @@ fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     for _ in 0..10 {
         if *pos >= bytes.len() {
-            return Err(VcsError::RevisionNotFound(
+            return Err(VcsError::Protocol(
                 "truncated svndiff varint".to_owned(),
             ));
         }
@@ -692,7 +909,7 @@ fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
         }
         shift += 7;
     }
-    Err(VcsError::RevisionNotFound(
+    Err(VcsError::Protocol(
         "invalid svndiff varint".to_owned(),
     ))
 }
@@ -721,15 +938,18 @@ fn encode_svndiff_full(new_data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn apply_svndiff_stream(base: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+/// Decode an svndiff stream, refusing to produce more than `max_total` bytes of
+/// output. The declared per-window target length is attacker-controlled, so it
+/// is validated against the remaining budget *before* any allocation.
+fn apply_svndiff_stream(base: &[u8], data: &[u8], max_total: usize) -> Result<Vec<u8>> {
     if data.len() < 4 || &data[..3] != b"SVN" {
-        return Err(VcsError::RevisionNotFound(
+        return Err(VcsError::Protocol(
             "invalid svndiff header".to_owned(),
         ));
     }
     let version = data[3];
     if version != 0 && version != 1 {
-        return Err(VcsError::RevisionNotFound(format!(
+        return Err(VcsError::Protocol(format!(
             "unsupported svndiff version {version}"
         )));
     }
@@ -741,25 +961,72 @@ fn apply_svndiff_stream(base: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         let tgt_len = decode_varint(data, &mut pos)? as usize;
         let ins_len = decode_varint(data, &mut pos)? as usize;
         let new_len = decode_varint(data, &mut pos)? as usize;
+        if tgt_len > max_total.saturating_sub(out.len()) {
+            return Err(VcsError::Protocol(
+                "svndiff output exceeds activity byte limit".to_owned(),
+            ));
+        }
         if pos + ins_len + new_len > data.len() {
-            return Err(VcsError::RevisionNotFound(
+            return Err(VcsError::Protocol(
                 "truncated svndiff window".to_owned(),
             ));
         }
-        let instructions = &data[pos..pos + ins_len];
+        let instructions_raw = &data[pos..pos + ins_len];
         pos += ins_len;
-        let new_data = &data[pos..pos + new_len];
+        let new_data_raw = &data[pos..pos + new_len];
         pos += new_len;
+
+        // svndiff1 (version 1) zlib-compresses the instruction and new-data
+        // sections; svndiff0 stores them raw. Treating compressed bytes as raw
+        // would silently corrupt the file, so decode per version.
+        let (instructions, new_data): (Vec<u8>, Vec<u8>) = if version == 1 {
+            (
+                inflate_section(instructions_raw, max_total)?,
+                inflate_section(new_data_raw, max_total)?,
+            )
+        } else {
+            (instructions_raw.to_vec(), new_data_raw.to_vec())
+        };
 
         let source_end = src_off.saturating_add(src_len);
         if source_end > base.len() {
-            return Err(VcsError::RevisionNotFound(
+            return Err(VcsError::Protocol(
                 "source view out of bounds".to_owned(),
             ));
         }
         let source = &base[src_off..source_end];
-        let target = apply_svndiff_window(source, instructions, new_data, tgt_len)?;
+        let target = apply_svndiff_window(source, &instructions, &new_data, tgt_len)?;
         out.extend_from_slice(&target);
+    }
+    Ok(out)
+}
+
+/// Decode one svndiff1 section: a varint of the original length followed by the
+/// payload, which is stored raw when its length equals the original length and
+/// zlib-compressed otherwise. `max_out` bounds the decompressed size (zip-bomb
+/// guard).
+fn inflate_section(section: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    let mut p = 0usize;
+    let original_len = decode_varint(section, &mut p)? as usize;
+    if original_len > max_out {
+        return Err(VcsError::Protocol(
+            "svndiff section exceeds activity byte limit".to_owned(),
+        ));
+    }
+    let payload = &section[p..];
+    if payload.len() == original_len {
+        // Stored uncompressed (compression did not help).
+        return Ok(payload.to_vec());
+    }
+    let mut out = Vec::with_capacity(original_len.min(1 << 20));
+    // Cap reads one past the declared size so an over-producing stream is
+    // detected as a mismatch rather than allowed to grow unbounded.
+    let mut decoder = ZlibDecoder::new(payload).take(original_len as u64 + 1);
+    decoder.read_to_end(&mut out)?;
+    if out.len() != original_len {
+        return Err(VcsError::Protocol(
+            "svndiff section size mismatch".to_owned(),
+        ));
     }
     Ok(out)
 }
@@ -770,7 +1037,10 @@ fn apply_svndiff_window(
     new_data: &[u8],
     target_len: usize,
 ) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(target_len);
+    // target_len is validated against the activity budget by the caller, but
+    // clamp the up-front reservation anyway so a malformed window cannot request
+    // a giant allocation; the Vec grows as needed.
+    let mut out = Vec::with_capacity(target_len.min(1 << 20));
     let mut ip = 0usize;
     let mut np = 0usize;
     while ip < instructions.len() {
@@ -786,7 +1056,7 @@ fn apply_svndiff_window(
                 let off = decode_varint(instructions, &mut ip)? as usize;
                 let end = off.saturating_add(len);
                 if end > source.len() {
-                    return Err(VcsError::RevisionNotFound(
+                    return Err(VcsError::Protocol(
                         "copy-source out of bounds".to_owned(),
                     ));
                 }
@@ -795,14 +1065,14 @@ fn apply_svndiff_window(
             1 => {
                 let off = decode_varint(instructions, &mut ip)? as usize;
                 if off >= out.len() {
-                    return Err(VcsError::RevisionNotFound(
+                    return Err(VcsError::Protocol(
                         "copy-target out of bounds".to_owned(),
                     ));
                 }
                 // Support overlap like memmove semantics.
                 for i in 0..len {
                     if off + i >= out.len() {
-                        return Err(VcsError::RevisionNotFound(
+                        return Err(VcsError::Protocol(
                             "copy-target overlap out of bounds".to_owned(),
                         ));
                     }
@@ -813,7 +1083,7 @@ fn apply_svndiff_window(
             2 => {
                 let end = np.saturating_add(len);
                 if end > new_data.len() {
-                    return Err(VcsError::RevisionNotFound(
+                    return Err(VcsError::Protocol(
                         "copy-new out of bounds".to_owned(),
                     ));
                 }
@@ -821,14 +1091,14 @@ fn apply_svndiff_window(
                 np = end;
             }
             _ => {
-                return Err(VcsError::RevisionNotFound(
+                return Err(VcsError::Protocol(
                     "unsupported svndiff instruction".to_owned(),
                 ));
             }
         }
     }
     if out.len() != target_len {
-        return Err(VcsError::RevisionNotFound(format!(
+        return Err(VcsError::Protocol(format!(
             "svndiff target size mismatch: expected {target_len}, got {}",
             out.len()
         )));
@@ -905,12 +1175,23 @@ fn update_report_xml(repo_root: &Path, from_rev: i64, youngest: i64) -> Result<S
                     };
                     let svndiff = encode_svndiff_full(&bytes);
                     let delta_b64 = base64::engine::general_purpose::STANDARD.encode(svndiff);
-                    entries.push_str(&format!(
-                        r#"<S:open-file name="{}" rev="{}"><S:apply-textdelta/><S:txdelta>{}</S:txdelta><S:close-file/></S:open-file>"#,
-                        xml_escape(&cp.path),
-                        rev.saturating_sub(1),
-                        delta_b64
-                    ));
+                    // A newly added/replaced path must be reported as add-file;
+                    // open-file targets an existing node the client already has.
+                    let is_add = matches!(
+                        cp.action,
+                        ChangedPathAction::Add | ChangedPathAction::Replace
+                    );
+                    let name = xml_escape(&cp.path);
+                    if is_add {
+                        entries.push_str(&format!(
+                            r#"<S:add-file name="{name}"><S:apply-textdelta/><S:txdelta>{delta_b64}</S:txdelta><S:close-file/></S:add-file>"#
+                        ));
+                    } else {
+                        entries.push_str(&format!(
+                            r#"<S:open-file name="{name}" rev="{}"><S:apply-textdelta/><S:txdelta>{delta_b64}</S:txdelta><S:close-file/></S:open-file>"#,
+                            rev.saturating_sub(1)
+                        ));
+                    }
                 }
             }
         }
@@ -989,10 +1270,24 @@ fn empty_report_xml() -> String {
 }
 
 fn xml_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    // Escape the full entity set so the result is safe in both element text and
+    // double-quoted attribute values (e.g. name="..." in update-report). Control
+    // characters illegal in XML 1.0 are dropped (they cannot be represented even
+    // as numeric refs) so arbitrary stored content can't produce malformed XML.
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\t' | '\n' | '\r' => out.push(c),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn svn_error_response(err: VcsError) -> HttpResponse {
@@ -1002,10 +1297,12 @@ fn svn_error_response(err: VcsError) -> HttpResponse {
             (StatusCode::LOCKED, "E155004")
         }
         VcsError::OutOfDate { .. } => (StatusCode::CONFLICT, "E160024"),
-        VcsError::PathOutsideRepository(_) | VcsError::RevisionNotFound(_) => {
-            (StatusCode::BAD_REQUEST, "E200009")
+        VcsError::PathOutsideRepository(_)
+        | VcsError::Protocol(_)
+        | VcsError::RevisionNotFound(_) => (StatusCode::BAD_REQUEST, "E200009"),
+        VcsError::CommitNotFound(_) | VcsError::BlobNotFound(_) => {
+            (StatusCode::NOT_FOUND, "E160013")
         }
-        VcsError::CommitNotFound(_) => (StatusCode::NOT_FOUND, "E160013"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "E000000"),
     };
     let xml = format!(
@@ -1019,4 +1316,172 @@ fn svn_error_response(err: VcsError) -> HttpResponse {
     HttpResponse::build(status)
         .insert_header((header::CONTENT_TYPE, "text/xml; charset=\"utf-8\""))
         .body(xml)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svndiff_roundtrip_full() {
+        let data = b"hello world, this is some content\nwith two lines\n";
+        let encoded = encode_svndiff_full(data);
+        let out = apply_svndiff_stream(&[], &encoded, 1 << 20).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn svndiff_empty_roundtrip() {
+        let encoded = encode_svndiff_full(b"");
+        let out = apply_svndiff_stream(&[], &encoded, 1 << 20).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn svndiff_rejects_oversized_target_before_allocating() {
+        // A tiny body that declares a ~1 TiB target length must be rejected by
+        // the budget check, not turned into a giant allocation.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"SVN\0");
+        encode_varint(0, &mut body); // source offset
+        encode_varint(0, &mut body); // source len
+        encode_varint(1u64 << 40, &mut body); // target len (~1 TiB)
+        encode_varint(0, &mut body); // instructions len
+        encode_varint(0, &mut body); // new data len
+        let res = apply_svndiff_stream(&[], &body, 1024);
+        assert!(res.is_err(), "oversized target must be rejected");
+    }
+
+    #[test]
+    fn svndiff_respects_exact_budget() {
+        let data = b"1234567890"; // 10 bytes
+        let encoded = encode_svndiff_full(data);
+        // Exactly enough budget succeeds.
+        assert!(apply_svndiff_stream(&[], &encoded, 10).is_ok());
+        // One byte short fails.
+        assert!(apply_svndiff_stream(&[], &encoded, 9).is_err());
+    }
+
+    fn section_v1(orig: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(orig).unwrap();
+        let comp = enc.finish().unwrap();
+        let mut section = Vec::new();
+        encode_varint(orig.len() as u64, &mut section);
+        // Store raw when compression did not shrink it (matches svndiff1 rules).
+        if comp.len() < orig.len() {
+            section.extend_from_slice(&comp);
+        } else {
+            section.extend_from_slice(orig);
+        }
+        section
+    }
+
+    fn build_svndiff1(target: &[u8]) -> Vec<u8> {
+        // Single window, single "copy from new data" (opcode 2) instruction.
+        let mut instr = Vec::new();
+        let l = target.len();
+        if l < 64 {
+            instr.push((2u8 << 6) | l as u8);
+        } else {
+            instr.push(2u8 << 6);
+            encode_varint(l as u64, &mut instr);
+        }
+        let instr_section = section_v1(&instr);
+        let new_section = section_v1(target);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"SVN\x01");
+        encode_varint(0, &mut out); // source offset
+        encode_varint(0, &mut out); // source len
+        encode_varint(l as u64, &mut out); // target len
+        encode_varint(instr_section.len() as u64, &mut out);
+        encode_varint(new_section.len() as u64, &mut out);
+        out.extend_from_slice(&instr_section);
+        out.extend_from_slice(&new_section);
+        out
+    }
+
+    #[test]
+    fn svndiff1_compressed_roundtrip() {
+        // Highly repetitive content so the new-data section actually compresses.
+        let data = "abc".repeat(500).into_bytes();
+        let stream = build_svndiff1(&data);
+        let out = apply_svndiff_stream(&[], &stream, 1 << 20).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn svndiff1_small_raw_section_roundtrip() {
+        // Tiny content stores sections raw (zlib would be larger).
+        let data = b"hello";
+        let stream = build_svndiff1(data);
+        let out = apply_svndiff_stream(&[], &stream, 1 << 20).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn percent_decode_basics() {
+        assert_eq!(percent_decode("my%20file.txt"), "my file.txt");
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("plain"), "plain");
+        // `+` stays literal in path components.
+        assert_eq!(percent_decode("a+b"), "a+b");
+        // Malformed escape is passed through.
+        assert_eq!(percent_decode("100%done"), "100%done");
+    }
+
+    #[test]
+    fn sanitize_blocks_encoded_traversal() {
+        // "%2e%2e" must not smuggle ".." past the guard.
+        assert!(sanitize_repo_rel("foo/%2e%2e/etc").is_err());
+        assert_eq!(sanitize_repo_rel("dir/my%20file.txt").unwrap(), "dir/my file.txt");
+    }
+
+    #[test]
+    fn sanitize_blocks_drive_and_absolute() {
+        // Windows drive prefixes (incl. percent-encoded colon) and mid-path
+        // drive letters must be rejected — PathBuf::push would escape the repo.
+        assert!(sanitize_repo_rel("C:/Windows/evil.txt").is_err());
+        assert!(sanitize_repo_rel("foo/C:/evil.txt").is_err());
+        assert!(sanitize_repo_rel("C:evil.txt").is_err());
+        assert!(sanitize_repo_rel("C%3A/Windows/evil.txt").is_err());
+        assert!(sanitize_repo_rel("file:stream").is_err());
+        // A normal nested path still works.
+        assert_eq!(sanitize_repo_rel("a/b/c.txt").unwrap(), "a/b/c.txt");
+    }
+
+    #[test]
+    fn join_repo_path_rejects_escaping_components() {
+        let root = Path::new("/repo/root");
+        assert!(join_repo_path(root, "a/b.txt").is_ok());
+        assert!(join_repo_path(root, "../escape").is_err());
+        assert!(join_repo_path(root, "C:/Windows").is_err());
+        assert!(join_repo_path(root, "foo/C:/x").is_err());
+    }
+
+    #[test]
+    fn xml_escape_drops_illegal_control_chars() {
+        // Bare control chars (here a NUL and a 0x01) are dropped; tab/newline kept.
+        let dirty = "a\u{0}b\u{1}c\td\ne";
+        let clean = xml_escape(dirty);
+        assert_eq!(clean, "abc\td\ne");
+        assert!(!clean.contains('\u{0}'));
+    }
+
+    #[test]
+    fn xml_escape_covers_attribute_chars() {
+        assert_eq!(
+            xml_escape(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_behaves() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"Secret"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+    }
 }
