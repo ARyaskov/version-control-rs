@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::Result;
 use crate::types::{Commit, FileChange, FileEntry};
@@ -71,10 +71,21 @@ impl WcDb {
     where
         F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin_write()?;
         let out = f(&tx)?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// Start a write transaction with `BEGIN IMMEDIATE`: the write lock is
+    /// taken up front, so a concurrent writer waits in busy_timeout instead of
+    /// failing with SQLITE_BUSY when a deferred read transaction tries to
+    /// upgrade (which busy_timeout cannot resolve in WAL mode).
+    fn begin_write(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -195,8 +206,10 @@ impl WcDb {
         )?;
 
         self.set_meta_if_missing("base_revision", "0")?;
-        self.set_meta_if_missing("head_revision", "0")?;
         self.set_meta_if_missing("depth", "infinity")?;
+        // Versions before 0.3 kept a copy of the head revision here.
+        self.conn
+            .execute("DELETE FROM meta WHERE k = 'head_revision'", [])?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -210,20 +223,14 @@ impl WcDb {
             .unwrap_or(0))
     }
 
+    /// HEAD revision number, derived from the revision index (the single
+    /// source of truth — there is no separately stored copy to drift).
     pub fn head_revision(&self) -> Result<i64> {
-        Ok(self
-            .meta("head_revision")?
-            .unwrap_or_else(|| "0".to_owned())
-            .parse()
-            .unwrap_or(0))
+        self.max_revision()
     }
 
     pub fn set_base_revision(&self, rev: i64) -> Result<()> {
         self.set_meta("base_revision", &rev.to_string())
-    }
-
-    pub fn set_head_revision(&self, rev: i64) -> Result<()> {
-        self.set_meta("head_revision", &rev.to_string())
     }
 
     pub fn depth(&self) -> Result<String> {
@@ -268,7 +275,7 @@ impl WcDb {
         working: &[FileEntry],
         changes: &[FileChange],
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin_write()?;
         let mut stmt = tx.prepare("SELECT path, changelist, inherited_props_json FROM nodes")?;
         let old_rows = stmt.query_map([], |r| {
             Ok((
@@ -475,7 +482,7 @@ impl WcDb {
     }
 
     pub fn replace_file_props_from_entries(&self, entries: &[FileEntry]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.begin_write()?;
         tx.execute("DELETE FROM file_props", [])?;
         for e in entries {
             for (name, value) in &e.props {
@@ -702,7 +709,6 @@ impl WcDb {
                 )?;
             }
             tx.execute("DELETE FROM pending_merges", [])?;
-            set_meta_tx(tx, "head_revision", &row.rev.to_string())?;
             set_meta_tx(tx, "base_revision", &new_base.to_string())?;
             Ok(())
         })
@@ -726,8 +732,6 @@ impl WcDb {
                     params![target_rev, merged_rev, source_path],
                 )?;
             }
-            let head = rows.last().map_or(0, |r| r.rev);
-            set_meta_tx(tx, "head_revision", &head.to_string())?;
             Ok(())
         })
     }
@@ -890,4 +894,45 @@ fn scope_chain(path: &str) -> Vec<String> {
         scopes.push(current.clone());
     }
     scopes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_read_modify_write_transactions_do_not_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".vcrs")).unwrap();
+        WcDb::open(dir.path()).unwrap();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let root = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    let db = WcDb::open(&root).unwrap();
+                    for _ in 0..5 {
+                        db.with_write_tx(|tx| {
+                            let v: i64 = tx.query_row(
+                                "SELECT CAST(v AS INTEGER) FROM meta WHERE k='base_revision'",
+                                [],
+                                |r| r.get(0),
+                            )?;
+                            std::thread::sleep(Duration::from_millis(5));
+                            tx.execute(
+                                "UPDATE meta SET v=?1 WHERE k='base_revision'",
+                                params![(v + 1).to_string()],
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        let db = WcDb::open(dir.path()).unwrap();
+        assert_eq!(db.base_revision().unwrap(), 20, "no lost updates");
+    }
 }

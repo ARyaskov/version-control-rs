@@ -93,7 +93,6 @@ impl Repository {
         self.migrate_legacy_layout()?;
         self.process_work_queue()?;
         if self.head_commit_id()?.is_none() {
-            wcdb.set_head_revision(0)?;
             wcdb.set_base_revision(0)?;
             self.sync_wcdb()?;
         }
