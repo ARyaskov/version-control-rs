@@ -708,3 +708,19 @@ fn update_applies_and_merges_property_changes() {
     assert_eq!(st.len(), 1);
     assert!(st[0].props_modified && !st[0].text_modified);
 }
+
+#[test]
+fn keyword_contraction_never_eats_following_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    let text = "Version $Rev: pending\nline two\ncosts $5\n";
+    write(root, "k.txt", text);
+    add(&client, &["k.txt"]);
+    client.set_property("k.txt", "svn:keywords", "Rev").unwrap();
+    client.commit("r1", "a").unwrap();
+    assert_eq!(
+        client.cat_revision_file("1", "k.txt").unwrap(),
+        text.as_bytes()
+    );
+}

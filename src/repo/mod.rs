@@ -2742,21 +2742,32 @@ fn apply_eol_style_for_working(text: &str, eol_style: Option<&String>) -> String
     }
 }
 
+/// Longest expanded keyword svn recognizes (`$Name: value $`), in bytes.
+const MAX_KEYWORD_LEN: usize = 255;
+
+/// Contract every expanded `$Name: ... $` back to `$Name$`. The closing `$`
+/// must be on the same line and within [`MAX_KEYWORD_LEN`] bytes (svn's
+/// rule); anything else is ordinary text and is left untouched, so a stray
+/// `$Rev:` can never swallow the content up to some later `$`.
 fn collapse_keyword(input: &str, name: &str) -> String {
     let needle = format!("${name}:");
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while let Some(pos) = input[i..].find(&needle) {
-        let abs = i + pos;
-        out.push_str(&input[i..abs]);
-        if let Some(end_rel) = input[abs..].find('$') {
-            let end = abs + end_rel;
-            out.push_str(&format!("${name}$"));
-            i = end + 1;
-        } else {
-            out.push_str(&input[abs..]);
-            i = input.len();
-            break;
+        let start = i + pos;
+        let after = start + needle.len();
+        let line_end = input[after..].find('\n').map_or(input.len(), |n| after + n);
+        let closing = input[after..line_end].find('$').map(|n| after + n);
+        match closing {
+            Some(end) if end + 1 - start <= MAX_KEYWORD_LEN => {
+                out.push_str(&input[i..start]);
+                out.push_str(&format!("${name}$"));
+                i = end + 1;
+            }
+            _ => {
+                out.push_str(&input[i..after]);
+                i = after;
+            }
         }
     }
     out.push_str(&input[i..]);
@@ -3062,4 +3073,25 @@ fn set_executable_if_supported(path: &Path, executable: bool) -> Result<()> {
 #[cfg(not(unix))]
 fn set_executable_if_supported(_path: &Path, _executable: bool) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyword_collapse_is_line_bounded() {
+        assert_eq!(collapse_keyword("id $Rev: 12 $ end", "Rev"), "id $Rev$ end");
+        // An unterminated keyword must not consume the following lines.
+        let text = "price $Rev: none\nkeep this line\ncost $5\n";
+        assert_eq!(collapse_keyword(text, "Rev"), text);
+        // Over-long "values" are not keywords either.
+        let long = format!("$Rev: {} $", "x".repeat(300));
+        assert_eq!(collapse_keyword(&long, "Rev"), long);
+        // Several keywords on one line.
+        assert_eq!(
+            collapse_keyword("$Rev: 1 $ and $Rev: 2 $", "Rev"),
+            "$Rev$ and $Rev$"
+        );
+    }
 }
