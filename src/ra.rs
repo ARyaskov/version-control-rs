@@ -16,25 +16,6 @@ pub enum Capability {
     Mergeinfo,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WireRequest {
-    GetHead,
-    LogRange { start: i64, end: i64 },
-    Cat { path: String, revision: i64 },
-    Blame { path: String, revision: i64 },
-    Lock { path: String },
-    Unlock { path: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WireResponse {
-    Ok,
-    Head { revision: i64 },
-    Cat { bytes: Vec<u8> },
-    Blame { lines: Vec<BlameLine> },
-    Error { message: String },
-}
-
 pub trait RaSession {
     fn capabilities(&self) -> &[Capability];
     fn checkout(&self, dest: &Path) -> Result<()>;

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use similar::TextDiff;
 
+use crate::content::is_binary_content;
 use crate::diff::unified_diff;
 use crate::error::{Result, VcsError};
 use crate::path::safe_join;
@@ -895,19 +896,6 @@ fn parse_peg_path(spec: &str) -> Result<(String, i64)> {
         .parse()
         .map_err(|_| VcsError::RevisionNotFound(spec.to_owned()))?;
     Ok((path, rev))
-}
-
-fn is_binary_content(bytes: &[u8]) -> bool {
-    // Sniff only the leading window (like svn) rather than the whole file.
-    let n = bytes.len().min(8192);
-    let window = &bytes[..n];
-    if window.contains(&0) {
-        return true;
-    }
-    match std::str::from_utf8(window) {
-        Ok(_) => false,
-        Err(e) => !(n < bytes.len() && e.error_len().is_none()),
-    }
 }
 
 fn render_property_diff(

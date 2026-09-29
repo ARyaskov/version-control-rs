@@ -1127,16 +1127,6 @@ impl WcDb {
         Ok(out)
     }
 
-    pub fn revision_for_commit(&self, commit_id: &str) -> Result<Option<i64>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT rev FROM revisions WHERE commit_id=?1")?;
-        let rev = stmt
-            .query_row(params![commit_id], |r| r.get(0))
-            .optional()?;
-        Ok(rev)
-    }
-
     pub fn commit_for_revision(&self, rev: i64) -> Result<Option<String>> {
         let mut stmt = self
             .conn
