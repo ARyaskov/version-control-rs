@@ -34,6 +34,8 @@ pub enum VcsError {
     NeedsLockRequired { path: String },
     #[error("invalid path outside repository: {0}")]
     PathOutsideRepository(String),
+    #[error("invalid repository path '{path}': {reason}")]
+    InvalidPath { path: String, reason: &'static str },
     #[error("server misconfiguration: {0}")]
     ServerMisconfigured(String),
     #[error("no staged changes to commit")]

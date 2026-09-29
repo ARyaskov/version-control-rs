@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Result, VcsError};
+use crate::path::validate_rel_path;
 use crate::types::{Commit, FileEntry};
 
 use super::{Repository, VCRS_DIR};
@@ -108,8 +109,41 @@ pub fn read_commit(repo: &Repository, id: &str) -> Result<Commit> {
     if !path.exists() {
         return Err(VcsError::CommitNotFound(id.to_owned()));
     }
-    let bytes = fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    parse_commit(&fs::read(path)?)
+}
+
+/// Deserialize a commit and reject any path that could escape the working copy
+/// once materialized. Commits may come from an untrusted remote, so this is the
+/// single gate every commit read goes through.
+pub fn parse_commit(bytes: &[u8]) -> Result<Commit> {
+    let commit: Commit = serde_json::from_slice(bytes)?;
+    validate_commit_paths(&commit)?;
+    Ok(commit)
+}
+
+fn validate_commit_paths(commit: &Commit) -> Result<()> {
+    for f in &commit.files {
+        validate_rel_path(&f.path)?;
+        if let Some(src) = &f.copy_from_path {
+            validate_rel_path(src)?;
+        }
+    }
+    for ch in &commit.changed_files {
+        validate_rel_path(&ch.path)?;
+        for p in [&ch.copy_from, &ch.moved_from, &ch.moved_to]
+            .into_iter()
+            .flatten()
+        {
+            validate_rel_path(p)?;
+        }
+    }
+    for cp in &commit.changed_paths {
+        validate_rel_path(&cp.path)?;
+        if let Some(src) = &cp.copyfrom_path {
+            validate_rel_path(src)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn new_commit_id(

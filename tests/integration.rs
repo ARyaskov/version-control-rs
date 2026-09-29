@@ -204,3 +204,43 @@ fn symbolic_revisions_resolve() {
     assert_eq!(repo.resolve_revision_spec("COMMITTED").unwrap(), 2);
     assert_eq!(repo.resolve_revision_spec("PREV").unwrap(), 1);
 }
+
+#[test]
+fn checkout_rejects_paths_escaping_the_working_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let client = Client::init(&remote).unwrap();
+    write(&remote, "payload.txt", "x\n");
+    let c = client.commit("r1", "a").unwrap();
+
+    // Tamper with the stored commit the way a malicious remote could.
+    let commit_file = remote.join(".vcrs/commits").join(format!("{}.json", c.id));
+    let json = fs::read_to_string(&commit_file)
+        .unwrap()
+        .replace("\"payload.txt\"", "\"../escaped.txt\"");
+    fs::write(&commit_file, json).unwrap();
+
+    let dest = dir.path().join("wc");
+    let res = Client::checkout_remote(&format!("file://{}", remote.display()), &dest, None);
+    assert!(res.is_err(), "crafted history must be rejected");
+    assert!(!dir.path().join("escaped.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn update_does_not_follow_dangling_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wc");
+    let outside = dir.path().join("outside.txt");
+    let client = Client::init(&root).unwrap();
+    write(&root, "f.txt", "v1\n");
+    client.commit("r1", "a").unwrap();
+    write(&root, "f.txt", "v2\n");
+    client.commit("r2", "a").unwrap();
+    client.update_to_revision("1").unwrap();
+
+    fs::remove_file(root.join("f.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("f.txt")).unwrap();
+    let _ = client.update_to_revision("HEAD");
+    assert!(!outside.exists(), "write must not follow the symlink");
+}

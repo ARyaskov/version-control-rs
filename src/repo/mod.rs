@@ -12,6 +12,7 @@ use similar::{Algorithm, DiffTag, capture_diff_slices};
 use walkdir::WalkDir;
 
 use crate::error::{Result, VcsError};
+use crate::path::{is_reserved_component, rel_from_fs, safe_join};
 use crate::types::{
     BlameLine, ChangeKind, ChangedPath, ChangedPathAction, Commit, Depth, FileChange, FileEntry,
     RevisionRange, TxnJournalEntry, TxnOp, TxnRecord,
@@ -89,6 +90,12 @@ impl Repository {
         Ok(())
     }
 
+    /// Resolve a repository-relative path under the working-copy root, refusing
+    /// invalid paths and paths that traverse a symbolic link.
+    fn abs_path(&self, rel: &str) -> Result<PathBuf> {
+        safe_join(&self.root, rel)
+    }
+
     pub fn head_commit_id(&self) -> Result<Option<String>> {
         storage::read_head(self)
     }
@@ -138,7 +145,7 @@ impl Repository {
                 continue;
             }
             let bytes = fs::read(path)?;
-            let commit: Commit = serde_json::from_slice(&bytes)?;
+            let commit = storage::parse_commit(&bytes)?;
             commits.push(commit);
         }
         commits.sort_by_key(|c| c.revision);
@@ -176,7 +183,7 @@ impl Repository {
                 if p.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                let commit: Commit = serde_json::from_slice(&fs::read(&p)?)?;
+                let commit = storage::parse_commit(&fs::read(&p)?)?;
                 for f in &commit.files {
                     referenced.insert(f.blob_id.clone());
                 }
@@ -258,7 +265,7 @@ impl Repository {
         let walker = WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(move |e| !is_excluded_toplevel(e.path(), &root));
+            .filter_entry(move |e| !is_excluded_path(e.path(), &root));
 
         for entry in walker {
             let entry = entry?;
@@ -267,11 +274,11 @@ impl Repository {
                 continue;
             }
 
-            let rel = path
-                .strip_prefix(&self.root)
-                .map_err(|_| VcsError::PathOutsideRepository(path.display().to_string()))?
-                .to_string_lossy()
-                .replace('\\', "/");
+            // Names that cannot be represented as a valid repository path
+            // (reserved metadata, control characters, ...) are never tracked.
+            let Some(rel) = rel_from_fs(&self.root, path) else {
+                continue;
+            };
 
             if ignore_set.is_match(&rel) || is_under_external(&rel, &external_paths) {
                 continue;
@@ -318,7 +325,7 @@ impl Repository {
         content: Option<Vec<u8>>,
         persist: bool,
     ) -> Result<FileEntry> {
-        let abs = rel_to_abs(&self.root, rel);
+        let abs = self.abs_path(rel)?;
         let md = fs::symlink_metadata(&abs)?;
         let is_symlink = md.file_type().is_symlink();
         let raw = if is_symlink {
@@ -387,7 +394,7 @@ impl Repository {
     /// what the snapshot would store as its blob. Used when a merge needs the
     /// working content but the snapshot did not persist it.
     fn normalized_working_bytes(&self, rel: &str) -> Result<Vec<u8>> {
-        let abs = rel_to_abs(&self.root, rel);
+        let abs = self.abs_path(rel)?;
         let md = fs::symlink_metadata(&abs)?;
         let is_symlink = md.file_type().is_symlink();
         let raw = if is_symlink {
@@ -660,7 +667,7 @@ impl Repository {
             .collect();
 
         for path in staged_full {
-            let abs = rel_to_abs(&self.root, path);
+            let abs = self.abs_path(path)?;
             if fs::symlink_metadata(&abs).is_ok() {
                 result.insert(path.clone(), self.working_entry(path, None, true)?);
             } else {
@@ -756,8 +763,8 @@ impl Repository {
     }
 
     pub fn copy_path(&self, src: &str, dst: &str) -> Result<()> {
-        let src_abs = rel_to_abs(&self.root, src);
-        let dst_abs = rel_to_abs(&self.root, dst);
+        let src_abs = self.abs_path(src)?;
+        let dst_abs = self.abs_path(dst)?;
         if let Some(parent) = dst_abs.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -766,8 +773,8 @@ impl Repository {
     }
 
     pub fn move_path(&self, src: &str, dst: &str) -> Result<()> {
-        let src_abs = rel_to_abs(&self.root, src);
-        let dst_abs = rel_to_abs(&self.root, dst);
+        let src_abs = self.abs_path(src)?;
+        let dst_abs = self.abs_path(dst)?;
         if let Some(parent) = dst_abs.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1051,7 +1058,7 @@ impl Repository {
     pub fn set_property(&self, path: &str, name: &str, value: &str) -> Result<()> {
         let wcdb = self.wcdb()?;
         wcdb.set_file_prop(path, name, value)?;
-        let abs = rel_to_abs(&self.root, path);
+        let abs = self.abs_path(path)?;
         if abs.exists() {
             if name == "svn:executable" {
                 set_executable_if_supported(&abs, !value.trim().is_empty())?;
@@ -1104,7 +1111,7 @@ impl Repository {
     pub fn del_property(&self, path: &str, name: &str) -> Result<()> {
         let wcdb = self.wcdb()?;
         wcdb.delete_file_prop(path, name)?;
-        let abs = rel_to_abs(&self.root, path);
+        let abs = self.abs_path(path)?;
         if abs.exists() && name == "svn:executable" {
             set_executable_if_supported(&abs, false)?;
         }
@@ -1128,7 +1135,7 @@ impl Repository {
             None => wcdb.clear_lock_token(path)?,
         }
         if self.path_requires_lock(path)? {
-            let abs = rel_to_abs(&self.root, path);
+            let abs = self.abs_path(path)?;
             if abs.exists() {
                 set_readonly_if_supported(&abs, token.is_none())?;
             }
@@ -1403,18 +1410,15 @@ impl Repository {
         let walker = WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(move |e| !is_excluded_toplevel(e.path(), &root));
+            .filter_entry(move |e| !is_excluded_path(e.path(), &root));
         for entry in walker {
             let entry = entry?;
             if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
                 continue;
             }
-            let rel = entry
-                .path()
-                .strip_prefix(&self.root)
-                .map_err(|_| VcsError::PathOutsideRepository(entry.path().display().to_string()))?
-                .to_string_lossy()
-                .replace('\\', "/");
+            let Some(rel) = rel_from_fs(&self.root, entry.path()) else {
+                continue;
+            };
             if !path_allowed_by_ambient_depth(&rel, depth, &ambient) {
                 let _ = remove_path_if_exists(entry.path());
             }
@@ -1500,16 +1504,14 @@ impl Repository {
                             &String::from_utf8_lossy(&self.read_blob(&te.blob_id)?),
                         );
 
-                        let abs = rel_to_abs(&self.root, path);
+                        let abs = self.abs_path(path)?;
                         if let Some(parent) = abs.parent() {
                             fs::create_dir_all(parent)?;
                         }
-                        let mine_path = format!("{}.mine", abs.display());
-                        let old_path = format!("{}.rOLD", abs.display());
-                        let new_path = format!("{}.rNEW", abs.display());
-                        fs::write(&mine_path, &working_bytes)?;
-                        fs::write(&old_path, self.read_blob(&be.blob_id)?)?;
-                        fs::write(&new_path, self.read_blob(&te.blob_id)?)?;
+                        let mine_path = write_sibling(&abs, ".mine", &working_bytes)?;
+                        let old_path = write_sibling(&abs, ".rOLD", &self.read_blob(&be.blob_id)?)?;
+                        let new_path = write_sibling(&abs, ".rNEW", &self.read_blob(&te.blob_id)?)?;
+                        remove_path_if_exists(&abs)?;
                         fs::write(&abs, merged.as_bytes())?;
 
                         wcdb.set_text_conflict_markers(path, &old_path, &new_path, &mine_path)?;
@@ -1533,7 +1535,7 @@ impl Repository {
             }
             match t {
                 Some(te) => {
-                    let abs = rel_to_abs(&self.root, path);
+                    let abs = self.abs_path(path)?;
                     if let Some(parent) = abs.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -1549,10 +1551,7 @@ impl Repository {
                     )?;
                 }
                 None => {
-                    let abs = rel_to_abs(&self.root, path);
-                    if abs.exists() {
-                        remove_path_if_exists(&abs)?;
-                    }
+                    remove_path_if_exists(&self.abs_path(path)?)?;
                 }
             }
         }
@@ -1594,7 +1593,7 @@ impl Repository {
             if filter.as_ref().is_some_and(|f| !f.contains(path)) {
                 continue;
             }
-            let abs = rel_to_abs(&self.root, path);
+            let abs = self.abs_path(path)?;
             if let Some(parent) = abs.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -1616,10 +1615,7 @@ impl Repository {
                 continue;
             }
             if !target_map.contains_key(path) {
-                let abs = rel_to_abs(&self.root, path);
-                if abs.exists() {
-                    remove_path_if_exists(&abs)?;
-                }
+                remove_path_if_exists(&self.abs_path(path)?)?;
             }
         }
 
@@ -1891,12 +1887,15 @@ fn assign_node_identity(parent: Option<&Commit>, snapshot: &mut [FileEntry], nex
     }
 }
 
-fn rel_to_abs(root: &Path, rel: &str) -> PathBuf {
-    let mut abs = root.to_path_buf();
-    for part in rel.split('/') {
-        abs.push(part);
-    }
-    abs
+/// Write a conflict artifact next to `abs` (e.g. `file.mine`), replacing any
+/// existing entry without following a symbolic link planted at that name.
+fn write_sibling(abs: &Path, suffix: &str, content: &[u8]) -> Result<String> {
+    let mut name = abs.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    let target = abs.with_file_name(name);
+    remove_path_if_exists(&target)?;
+    fs::write(&target, content)?;
+    Ok(target.display().to_string())
 }
 
 fn changed_entry(a: Option<&FileEntry>, b: Option<&FileEntry>) -> bool {
@@ -1955,16 +1954,22 @@ fn build_ignore_globset(patterns: &[String]) -> GlobSet {
     builder.build().unwrap_or_else(|_| GlobSet::empty())
 }
 
-/// True when the path's top-level component is one we never track, so WalkDir
-/// can prune the whole subtree instead of stat-ing every blob/build artifact.
-fn is_excluded_toplevel(path: &Path, root: &Path) -> bool {
+/// True when the path is a directory we never track, so WalkDir can prune the
+/// whole subtree instead of stat-ing every blob/build artifact.
+fn is_excluded_path(path: &Path, root: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(root) else {
         return false;
     };
-    matches!(
-        rel.components().next().and_then(|c| c.as_os_str().to_str()),
-        Some(".vcrs") | Some(".git") | Some("target")
-    )
+    let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    // Metadata directories are pruned at any depth (nested checkouts); the
+    // build directory only at the top level.
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    is_reserved_component(name) || first == "target"
 }
 
 /// Resolve inherited properties for `path` from the pre-loaded scope map,
@@ -2145,10 +2150,11 @@ fn write_entry_to_working(
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
-    if !path.exists() {
+    // symlink_metadata, not exists(): a dangling symlink must be removed too,
+    // otherwise the following write would follow it outside the working copy.
+    let Ok(md) = fs::symlink_metadata(path) else {
         return Ok(());
-    }
-    let md = fs::symlink_metadata(path)?;
+    };
     if md.file_type().is_dir() {
         fs::remove_dir_all(path)?;
     } else {

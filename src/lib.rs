@@ -2,6 +2,7 @@ pub mod client;
 pub mod diff;
 pub mod error;
 pub mod merge;
+pub mod path;
 pub mod ra;
 pub mod repo;
 #[cfg(feature = "serve-http")]

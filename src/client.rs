@@ -6,6 +6,7 @@ use similar::TextDiff;
 
 use crate::diff::unified_diff;
 use crate::error::{Result, VcsError};
+use crate::path::safe_join;
 use crate::ra::{FileRaSession, RaSession, RemoteConfig};
 use crate::repo::{GcStats, MergeOutcome, Repository};
 use crate::types::{
@@ -443,7 +444,7 @@ impl Client {
                 None => String::new(),
             };
 
-            let current_abs = rel_to_abs(&root, &change.path);
+            let current_abs = safe_join(&root, &change.path)?;
             let new_text = if current_abs.exists() {
                 String::from_utf8_lossy(&std::fs::read(&current_abs)?).to_string()
             } else {
@@ -487,7 +488,7 @@ impl Client {
             .file_entry_at_revision(rev, &path)?
             .ok_or_else(|| VcsError::CommitNotFound(format!("r{rev}:{path}")))?;
 
-        let current_abs = rel_to_abs(&self.repo.root, &path);
+        let current_abs = safe_join(&self.repo.root, &path)?;
         let new_bytes = if current_abs.exists() {
             std::fs::read(&current_abs)?
         } else {
@@ -652,7 +653,7 @@ impl Client {
             path: path.to_owned(),
         })?;
 
-        let abs = self.root().join(path);
+        let abs = safe_join(self.root(), path)?;
         let working_bytes = if abs.exists() {
             fs::read(abs)?
         } else {
@@ -690,15 +691,7 @@ fn ensure_hunk_supported(change: &FileChange) -> Result<()> {
 }
 
 fn normalize_rel(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-fn rel_to_abs(root: &Path, rel: &str) -> PathBuf {
-    let mut abs = root.to_path_buf();
-    for part in rel.split('/') {
-        abs.push(part);
-    }
-    abs
+    crate::path::normalize_rel(path)
 }
 
 fn split_lines_keep_eol(text: &str) -> Vec<String> {

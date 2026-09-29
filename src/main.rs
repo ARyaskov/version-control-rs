@@ -365,7 +365,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Lock(args) => {
             let client = Client::discover(".")?;
-            client.lock_remote(&args.path)?;
+            client.lock_remote(&repo_path(&client, &args.path)?)?;
             if json_output {
                 print_json(json!({"ok": true, "command": "lock", "path": args.path}))?;
             } else {
@@ -374,7 +374,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Unlock(args) => {
             let client = Client::discover(".")?;
-            client.unlock_remote(&args.path)?;
+            client.unlock_remote(&repo_path(&client, &args.path)?)?;
             if json_output {
                 print_json(json!({"ok": true, "command": "unlock", "path": args.path}))?;
             } else {
@@ -383,7 +383,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Copy(args) => {
             let client = Client::discover(".")?;
-            client.copy_path(&args.src, &args.dst)?;
+            client.copy_path(
+                &repo_path(&client, &args.src)?,
+                &repo_path(&client, &args.dst)?,
+            )?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -397,7 +400,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Move(args) => {
             let client = Client::discover(".")?;
-            client.move_path(&args.src, &args.dst)?;
+            client.move_path(
+                &repo_path(&client, &args.src)?,
+                &repo_path(&client, &args.dst)?,
+            )?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -448,7 +454,16 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Diff(args) => {
             let client = Client::discover(".")?;
-            let patch = client.diff(args.path.as_deref(), args.peg.as_deref())?;
+            let filter = match args.path.as_deref() {
+                Some(p) => Some(resolve_user_path(&client, p)?).filter(|p| !p.is_empty()),
+                None => None,
+            };
+            let peg = args
+                .peg
+                .as_deref()
+                .map(|p| repo_peg(&client, p))
+                .transpose()?;
+            let patch = client.diff(filter.as_deref(), peg.as_deref())?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -463,7 +478,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Cat(args) => {
             let client = Client::discover(".")?;
-            let bytes = client.cat_peg(&args.peg)?;
+            let bytes = client.cat_peg(&repo_peg(&client, &args.peg)?)?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -587,7 +602,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Revert(args) => {
             let client = Client::discover(".")?;
-            let changed = client.revert(&args.paths)?;
+            let changed = client.revert(&repo_paths(&client, &args.paths)?)?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -601,7 +616,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Blame(args) => {
             let client = Client::discover(".")?;
-            let lines = client.blame(&args.path, args.revision.as_deref())?;
+            let lines = client.blame(&repo_path(&client, &args.path)?, args.revision.as_deref())?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -694,7 +709,12 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Stage(args) => {
             let client = Client::discover(".")?;
-            let staged = client.stage_paths(&args.paths)?;
+            let paths = repo_paths(&client, &args.paths)?;
+            let staged = if paths.is_empty() && !args.paths.is_empty() {
+                client.stage_all()?
+            } else {
+                client.stage_paths(&paths)?
+            };
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -707,7 +727,13 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Unstage(args) => {
             let client = Client::discover(".")?;
-            let staged = client.unstage_paths(&args.paths)?;
+            let paths = repo_paths(&client, &args.paths)?;
+            let staged = if paths.is_empty() && !args.paths.is_empty() {
+                client.clear_staging()?;
+                Vec::new()
+            } else {
+                client.unstage_paths(&paths)?
+            };
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -745,7 +771,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Hunks(args) => {
             let client = Client::discover(".")?;
-            let hunks = client.hunks(&args.path)?;
+            let hunks = client.hunks(&repo_path(&client, &args.path)?)?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -767,7 +793,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::StageHunks(args) => {
             let client = Client::discover(".")?;
-            let selected = client.stage_hunks(&args.path, &args.indices)?;
+            let selected = client.stage_hunks(&repo_path(&client, &args.path)?, &args.indices)?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -781,7 +807,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::UnstageHunks(args) => {
             let client = Client::discover(".")?;
-            let selected = client.unstage_hunks(&args.path, &args.indices)?;
+            let selected = client.unstage_hunks(&repo_path(&client, &args.path)?, &args.indices)?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -795,7 +821,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::PropSet(args) => {
             let client = Client::discover(".")?;
-            client.set_property(&args.path, &args.name, &args.value)?;
+            client.set_property(&repo_path(&client, &args.path)?, &args.name, &args.value)?;
             if json_output {
                 print_json(
                     json!({"ok": true, "command": "prop-set", "path": args.path, "name": args.name}),
@@ -806,7 +832,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::PropGet(args) => {
             let client = Client::discover(".")?;
-            let value = client.get_property(&args.path, &args.name)?;
+            let value = client.get_property(&repo_path(&client, &args.path)?, &args.name)?;
             if json_output {
                 print_json(json!({
                     "ok": true,
@@ -824,7 +850,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::PropDel(args) => {
             let client = Client::discover(".")?;
-            client.del_property(&args.path, &args.name)?;
+            client.del_property(&repo_path(&client, &args.path)?, &args.name)?;
             if json_output {
                 print_json(
                     json!({"ok": true, "command": "prop-del", "path": args.path, "name": args.name}),
@@ -835,7 +861,11 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::IPropSet(args) => {
             let client = Client::discover(".")?;
-            client.set_inherited_property(&args.scope, &args.name, &args.value)?;
+            client.set_inherited_property(
+                &resolve_user_path(&client, &args.scope)?,
+                &args.name,
+                &args.value,
+            )?;
             if json_output {
                 print_json(
                     json!({"ok": true, "command": "iprop-set", "scope": args.scope, "name": args.name}),
@@ -859,7 +889,7 @@ fn run(cli: Cli) -> Result<()> {
             let client = Client::discover(".")?;
             match args.command {
                 ChangelistCmd::Set { path, name } => {
-                    client.set_changelist(&path, Some(&name))?;
+                    client.set_changelist(&repo_path(&client, &path)?, Some(&name))?;
                     if json_output {
                         print_json(
                             json!({"ok": true, "command": "changelist-set", "path": path, "name": name}),
@@ -869,7 +899,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 ChangelistCmd::Clear { path } => {
-                    client.set_changelist(&path, None)?;
+                    client.set_changelist(&repo_path(&client, &path)?, None)?;
                     if json_output {
                         print_json(
                             json!({"ok": true, "command": "changelist-clear", "path": path}),
@@ -934,7 +964,7 @@ fn run(cli: Cli) -> Result<()> {
                     target_url,
                     revision,
                 } => {
-                    client.set_external(&path, &target_url, revision)?;
+                    client.set_external(&repo_path(&client, &path)?, &target_url, revision)?;
                     if json_output {
                         print_json(
                             json!({"ok": true, "command": "externals-set", "path": path, "target_url": target_url}),
@@ -1014,6 +1044,47 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve a path typed on the command line (relative to the current
+/// directory, or absolute) to a validated repository-relative path. The
+/// working-copy root itself resolves to an empty string.
+fn resolve_user_path(client: &Client, input: &str) -> Result<String> {
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    version_control_rs::path::user_path_to_rel(client.root(), &cwd, input)
+}
+
+/// Like [`resolve_user_path`] but the path must name an entry below the root.
+fn repo_path(client: &Client, input: &str) -> Result<String> {
+    let rel = resolve_user_path(client, input)?;
+    if rel.is_empty() {
+        return Err(VcsError::InvalidPath {
+            path: input.to_owned(),
+            reason: "the working-copy root is not a file",
+        });
+    }
+    Ok(rel)
+}
+
+/// Resolve a list of paths; naming the root selects everything (empty list).
+fn repo_paths(client: &Client, inputs: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for input in inputs {
+        let rel = resolve_user_path(client, input)?;
+        if rel.is_empty() {
+            return Ok(Vec::new());
+        }
+        out.push(rel);
+    }
+    Ok(out)
+}
+
+/// Resolve the path part of a `PATH@REV` peg specification.
+fn repo_peg(client: &Client, spec: &str) -> Result<String> {
+    match spec.rsplit_once('@') {
+        Some((path, rev)) if !path.is_empty() => Ok(format!("{}@{rev}", repo_path(client, path)?)),
+        _ => Ok(spec.to_owned()),
+    }
 }
 
 fn print_json(value: serde_json::Value) -> Result<()> {
