@@ -22,19 +22,25 @@ pub struct Client {
     repo: Repository,
 }
 
+/// Staging area. Partially staged files record the *content* of the chosen
+/// hunks (a hash of their position and lines), not their index: if the file
+/// changes after staging, the selection can no longer silently shift onto
+/// other hunks.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct StageIndex {
     version: u32,
     #[serde(default)]
     staged_files: BTreeSet<String>,
     #[serde(default)]
-    staged_hunks: BTreeMap<String, BTreeSet<usize>>,
+    staged_hunks: BTreeMap<String, BTreeSet<String>>,
 }
+
+const STAGE_INDEX_VERSION: u32 = 3;
 
 impl Default for StageIndex {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: STAGE_INDEX_VERSION,
             staged_files: BTreeSet::new(),
             staged_hunks: BTreeMap::new(),
         }
@@ -44,6 +50,8 @@ impl Default for StageIndex {
 #[derive(Debug, Clone)]
 struct ComputedHunk {
     index: usize,
+    /// Content hash identifying the hunk independently of its index.
+    id: String,
     old_start: usize,
     old_end: usize,
     new_start: usize,
@@ -188,15 +196,7 @@ impl Client {
 
     pub fn hunks(&self, path: &str) -> Result<Vec<DiffHunk>> {
         let norm = normalize_rel(path);
-        let change = self
-            .status()?
-            .into_iter()
-            .find(|c| c.path == norm)
-            .ok_or_else(|| VcsError::HunkStagingUnsupported { path: norm.clone() })?;
-        ensure_hunk_supported(&change)?;
-
-        let (base, working) = self.load_text_pair(&norm)?;
-        let computed = compute_hunks(&base, &working);
+        let computed = self.current_hunks(&norm)?;
         let idx = self.load_stage_index()?;
         let selected = idx.staged_hunks.get(&norm).cloned().unwrap_or_default();
 
@@ -208,8 +208,9 @@ impl Client {
                 old_len: h.old_end.saturating_sub(h.old_start),
                 new_start: h.new_start + 1,
                 new_len: h.new_end.saturating_sub(h.new_start),
+                staged: selected.contains(&h.id),
                 preview: h.preview,
-                staged: selected.contains(&h.index),
+                id: h.id,
             })
             .collect())
     }
@@ -217,49 +218,63 @@ impl Client {
     pub fn stage_hunks(&self, path: &str, indices: &[usize]) -> Result<Vec<usize>> {
         let _lock = self.repo.lock()?;
         let norm = normalize_rel(path);
-        let hunks = self.hunks(&norm)?;
-        let max = hunks.len();
+        let hunks = self.current_hunks(&norm)?;
         let mut idx = self.load_stage_index()?;
         idx.staged_files.remove(&norm);
         let set = idx.staged_hunks.entry(norm.clone()).or_default();
+        // Re-staging refreshes the selection: ids of hunks that no longer
+        // exist (the file changed since) are dropped.
+        let current: BTreeSet<&String> = hunks.iter().map(|h| &h.id).collect();
+        set.retain(|id| current.contains(id));
         for i in indices {
-            if *i >= max {
-                return Err(VcsError::InvalidHunkIndex {
-                    path: norm,
-                    index: *i,
-                });
-            }
-            set.insert(*i);
+            let hunk = hunks.get(*i).ok_or_else(|| VcsError::InvalidHunkIndex {
+                path: norm.clone(),
+                index: *i,
+            })?;
+            set.insert(hunk.id.clone());
         }
-        let out: Vec<usize> = set.iter().copied().collect();
+        let staged = staged_indices(&hunks, set);
         if set.is_empty() {
             idx.staged_hunks.remove(&norm);
         }
         self.save_stage_index(&idx)?;
-        Ok(out)
+        Ok(staged)
     }
 
     pub fn unstage_hunks(&self, path: &str, indices: &[usize]) -> Result<Vec<usize>> {
         let _lock = self.repo.lock()?;
         let norm = normalize_rel(path);
+        let hunks = self.current_hunks(&norm)?;
         let mut idx = self.load_stage_index()?;
-        let mut remove_entry = false;
-        let out = if let Some(set) = idx.staged_hunks.get_mut(&norm) {
-            for i in indices {
-                set.remove(i);
-            }
-            if set.is_empty() {
-                remove_entry = true;
-            }
-            set.iter().copied().collect()
-        } else {
-            Vec::new()
+        let Some(set) = idx.staged_hunks.get_mut(&norm) else {
+            return Ok(Vec::new());
         };
-        if remove_entry {
+        for i in indices {
+            if let Some(hunk) = hunks.get(*i) {
+                set.remove(&hunk.id);
+            }
+        }
+        let staged = staged_indices(&hunks, set);
+        if set.is_empty() {
             idx.staged_hunks.remove(&norm);
         }
         self.save_stage_index(&idx)?;
-        Ok(out)
+        Ok(staged)
+    }
+
+    /// Hunks of a modified text file, BASE vs the working file (both in
+    /// repository form).
+    fn current_hunks(&self, path: &str) -> Result<Vec<ComputedHunk>> {
+        let change = self
+            .status()?
+            .into_iter()
+            .find(|c| c.path == path)
+            .ok_or_else(|| VcsError::HunkStagingUnsupported {
+                path: path.to_owned(),
+            })?;
+        ensure_hunk_supported(&change)?;
+        let (base, working) = self.load_text_pair(path)?;
+        Ok(compute_hunks(&base, &working))
     }
 
     pub fn commit_staged(&self, message: &str, author: &str, push: bool) -> Result<Commit> {
@@ -292,15 +307,18 @@ impl Client {
 
             let (base, working) = self.load_text_pair(&path)?;
             let hunks = compute_hunks(&base, &working);
-            for i in &hset {
-                if *i >= hunks.len() {
-                    return Err(VcsError::InvalidHunkIndex {
-                        path: path.clone(),
-                        index: *i,
-                    });
-                }
+            // Every staged hunk must still exist verbatim; otherwise the file
+            // changed after staging and the selection is ambiguous.
+            let current: BTreeSet<&String> = hunks.iter().map(|h| &h.id).collect();
+            if hset.iter().any(|id| !current.contains(id)) {
+                return Err(VcsError::StaleHunkSelection { path: path.clone() });
             }
-            let staged_text = apply_selected_hunks(&base, &working, &hunks, &hset);
+            let selected: BTreeSet<usize> = hunks
+                .iter()
+                .filter(|h| hset.contains(&h.id))
+                .map(|h| h.index)
+                .collect();
+            let staged_text = apply_selected_hunks(&base, &working, &hunks, &selected);
             if staged_text != base {
                 staged_partial.insert(path.clone(), staged_text);
             }
@@ -455,46 +473,38 @@ impl Client {
         self.repo.move_path(src, dst)
     }
 
+    /// Unified diffs of local changes against BASE (the revision the working
+    /// copy is based on), comparing repository-form content so that eol and
+    /// keyword expansion never show up as changes. `path_filter` selects a
+    /// file or everything below a directory.
     pub fn diff_working(&self, path_filter: Option<&str>) -> Result<Vec<(String, String)>> {
+        let filter = path_filter.map(normalize_rel);
         let status = self.repo.status()?;
-        if status.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let root = self.repo.root.clone();
         let current = self.repo.snapshot_working_copy()?;
         let current_map: BTreeMap<&str, &FileEntry> =
             current.iter().map(|f| (f.path.as_str(), f)).collect();
 
-        let head = self.repo.head_commit()?;
-        let head_map: BTreeMap<&str, &FileEntry> = head
-            .as_ref()
-            .map(|c| c.files.iter().map(|f| (f.path.as_str(), f)).collect())
-            .unwrap_or_default();
-
         let mut out = Vec::new();
         for change in status {
-            if let Some(filter) = path_filter
-                && !change.path.contains(filter)
+            if let Some(filter) = filter.as_deref()
+                && !(change.path == filter || change.path.starts_with(&format!("{filter}/")))
             {
                 continue;
             }
 
-            let old_entry = head_map.get(change.path.as_str()).copied();
+            let old_entry = self.repo.base_file_entry(&change.path)?;
             let new_entry = current_map.get(change.path.as_str()).copied();
 
-            let old_text = match old_entry {
+            let old_text = match &old_entry {
                 Some(entry) => {
                     String::from_utf8_lossy(&self.repo.read_blob(&entry.blob_id)?).to_string()
                 }
                 None => String::new(),
             };
-
-            let current_abs = safe_join(&root, &change.path)?;
-            let new_text = if current_abs.exists() {
-                String::from_utf8_lossy(&std::fs::read(&current_abs)?).to_string()
-            } else {
-                String::new()
+            let new_text = match new_entry {
+                Some(_) => String::from_utf8_lossy(&self.repo.working_repo_bytes(&change.path)?)
+                    .to_string(),
+                None => String::new(),
             };
 
             let old_label = format!("a/{}", change.path);
@@ -502,7 +512,7 @@ impl Client {
 
             let mut rendered = String::new();
             if change.text_modified {
-                let old_binary = old_entry.is_some_and(|e| e.is_binary);
+                let old_binary = old_entry.as_ref().is_some_and(|e| e.is_binary);
                 let new_binary = new_entry.is_some_and(|e| e.is_binary);
                 if change.is_binary || old_binary || new_binary {
                     rendered.push_str(&render_binary_diff_notice(&change.path));
@@ -513,7 +523,7 @@ impl Client {
 
             if change.props_modified {
                 rendered.push_str(&render_property_diff(
-                    old_entry.map(|e| &e.props),
+                    old_entry.as_ref().map(|e| &e.props),
                     new_entry.map(|e| &e.props),
                     &change.path,
                 ));
@@ -535,8 +545,8 @@ impl Client {
             .ok_or_else(|| VcsError::CommitNotFound(format!("r{rev}:{path}")))?;
 
         let current_abs = safe_join(&self.repo.root, &path)?;
-        let new_bytes = if current_abs.exists() {
-            std::fs::read(&current_abs)?
+        let new_bytes = if fs::symlink_metadata(&current_abs).is_ok() {
+            self.repo.working_repo_bytes(&path)?
         } else {
             Vec::new()
         };
@@ -672,8 +682,22 @@ impl Client {
         if !path.exists() {
             return Ok(StageIndex::default());
         }
-        let bytes = fs::read(path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+        if version < u64::from(STAGE_INDEX_VERSION) {
+            // Older indexes stored hunk *indices*, which cannot be mapped to
+            // content reliably; keep the fully staged files and drop those.
+            let staged_files = value
+                .get("staged_files")
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()?
+                .unwrap_or_default();
+            return Ok(StageIndex {
+                staged_files,
+                ..StageIndex::default()
+            });
+        }
+        Ok(serde_json::from_value(value)?)
     }
 
     fn save_stage_index(&self, idx: &StageIndex) -> Result<()> {
@@ -689,26 +713,23 @@ impl Client {
         Ok(self.status()?.into_iter().map(|c| c.path).collect())
     }
 
+    /// BASE text and working text of `path`, both in repository form.
     fn load_text_pair(&self, path: &str) -> Result<(String, String)> {
-        let base_bytes = match self.cat_revision_file("HEAD", path) {
-            Ok(bytes) => bytes,
-            Err(VcsError::CommitNotFound(_)) => Vec::new(),
-            Err(e) => return Err(e),
-        };
-        let base = String::from_utf8(base_bytes).map_err(|_| VcsError::HunkStagingUnsupported {
+        let unsupported = || VcsError::HunkStagingUnsupported {
             path: path.to_owned(),
-        })?;
-
+        };
+        let base_bytes = match self.repo.base_file_entry(path)? {
+            Some(entry) => self.repo.read_blob(&entry.blob_id)?,
+            None => Vec::new(),
+        };
+        let base = String::from_utf8(base_bytes).map_err(|_| unsupported())?;
         let abs = safe_join(self.root(), path)?;
-        let working_bytes = if abs.exists() {
-            fs::read(abs)?
+        let working_bytes = if fs::symlink_metadata(&abs).is_ok() {
+            self.repo.working_repo_bytes(path)?
         } else {
             Vec::new()
         };
-        let working =
-            String::from_utf8(working_bytes).map_err(|_| VcsError::HunkStagingUnsupported {
-                path: path.to_owned(),
-            })?;
+        let working = String::from_utf8(working_bytes).map_err(|_| unsupported())?;
         Ok((base, working))
     }
 }
@@ -742,6 +763,15 @@ fn normalize_all(paths: &[String]) -> Vec<String> {
 
 fn normalize_rel(path: &str) -> String {
     crate::path::normalize_rel(path)
+}
+
+/// Indices (in `hunks`) of the hunks whose ids are selected.
+fn staged_indices(hunks: &[ComputedHunk], selected: &BTreeSet<String>) -> Vec<usize> {
+    hunks
+        .iter()
+        .filter(|h| selected.contains(&h.id))
+        .map(|h| h.index)
+        .collect()
 }
 
 fn split_lines_keep_eol(text: &str) -> Vec<String> {
@@ -779,8 +809,18 @@ fn compute_hunks(base: &str, working: &str) -> Vec<ComputedHunk> {
             }
         }
 
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(old_start as u64).to_le_bytes());
+        for line in &diff.old_slices()[old_start..old_end] {
+            hasher.update(line.as_bytes());
+        }
+        hasher.update(b"\0");
+        for line in &diff.new_slices()[new_start..new_end] {
+            hasher.update(line.as_bytes());
+        }
         out.push(ComputedHunk {
             index: idx,
+            id: hasher.finalize().to_hex().to_string(),
             old_start,
             old_end,
             new_start,

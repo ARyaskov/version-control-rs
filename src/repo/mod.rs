@@ -354,6 +354,20 @@ impl Repository {
         Ok(out)
     }
 
+    /// The BASE revision's entry for `path`, if the file exists there.
+    pub fn base_file_entry(&self, path: &str) -> Result<Option<FileEntry>> {
+        Ok(self
+            .base_files(&self.wcdb()?)?
+            .into_iter()
+            .find(|f| f.path == path))
+    }
+
+    /// Repository-form bytes of a working file (eol normalized, keywords
+    /// contracted) — what a commit would store.
+    pub fn working_repo_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        self.normalized_working_bytes(path)
+    }
+
     /// Files of the BASE revision (empty before the first update/commit).
     fn base_files(&self, wcdb: &WcDb) -> Result<Vec<FileEntry>> {
         let base_rev = wcdb.base_revision()?;

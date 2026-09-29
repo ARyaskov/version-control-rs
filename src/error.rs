@@ -50,6 +50,8 @@ pub enum VcsError {
     HunkStagingUnsupported { path: String },
     #[error("hunk index {index} is out of range for path '{path}'")]
     InvalidHunkIndex { path: String, index: usize },
+    #[error("'{path}' changed after hunks were staged; stage its hunks again")]
+    StaleHunkSelection { path: String },
     #[error("failed to restore unstaged changes after staged commit: {0}")]
     RestoreFailed(String),
     #[error("i/o error: {0}")]

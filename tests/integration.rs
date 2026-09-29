@@ -724,3 +724,84 @@ fn keyword_contraction_never_eats_following_text() {
         text.as_bytes()
     );
 }
+
+#[test]
+fn diff_is_against_base_not_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "f.txt", "v1\n");
+    add(&client, &["f.txt"]);
+    client.commit("r1", "a").unwrap();
+    write(root, "f.txt", "v2\n");
+    client.commit("r2", "a").unwrap();
+    client.update_to_revision("1").unwrap();
+    assert_eq!(client.diff(None, None).unwrap(), "");
+
+    write(root, "f.txt", "v1b\n");
+    let patch = client.diff(None, None).unwrap();
+    assert!(
+        patch.contains("-v1\n") && patch.contains("+v1b\n"),
+        "{patch}"
+    );
+    assert!(!patch.contains("v2"), "{patch}");
+}
+
+#[test]
+fn diff_ignores_eol_translation_and_filters_by_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "src/a.txt", "1\n2\n3\n");
+    write(root, "srcfoo.txt", "x\n");
+    add(&client, &["src/a.txt", "srcfoo.txt"]);
+    client
+        .set_property("src/a.txt", "svn:eol-style", "CRLF")
+        .unwrap();
+    client.commit("r1", "a").unwrap();
+    assert_eq!(read(root, "src/a.txt"), "1\r\n2\r\n3\r\n");
+
+    write(root, "src/a.txt", "1\r\nTWO\r\n3\r\n");
+    write(root, "srcfoo.txt", "y\n");
+    let patch = client.diff(Some("src"), None).unwrap();
+    assert!(!patch.contains("srcfoo"), "{patch}");
+    let removed = patch
+        .lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .count();
+    assert_eq!(removed, 1, "only the edited line differs:\n{patch}");
+}
+
+#[test]
+fn stale_hunk_selection_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    let text = |two: &str, twenty_eight: &str| -> String {
+        (1..=30)
+            .map(|i| match i {
+                2 => format!("{two}\n"),
+                28 => format!("{twenty_eight}\n"),
+                _ => format!("{i}\n"),
+            })
+            .collect()
+    };
+    write(root, "f.txt", &text("2", "28"));
+    add(&client, &["f.txt"]);
+    client.commit("r1", "a").unwrap();
+
+    write(root, "f.txt", &text("TWO", "TWENTY-EIGHT"));
+    assert_eq!(client.hunks("f.txt").unwrap().len(), 2);
+    client.stage_hunks("f.txt", &[1]).unwrap();
+
+    // Editing the staged hunk afterwards must not silently commit another one.
+    write(root, "f.txt", &text("TWO", "XXVIII"));
+    let err = client.commit_staged("partial", "a", false).unwrap_err();
+    assert!(err.to_string().contains("stage its hunks again"), "{err}");
+
+    // Re-staging picks the current content.
+    client.stage_hunks("f.txt", &[1]).unwrap();
+    client.commit_staged("partial", "a", false).unwrap();
+    let committed = String::from_utf8(client.cat_revision_file("2", "f.txt").unwrap()).unwrap();
+    assert_eq!(committed, text("2", "XXVIII"));
+}

@@ -141,4 +141,7 @@ pub struct DiffHunk {
     pub new_len: usize,
     pub preview: String,
     pub staged: bool,
+    /// Stable identifier of the hunk content (what the staging area records).
+    #[serde(default)]
+    pub id: String,
 }
