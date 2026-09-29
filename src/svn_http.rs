@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use actix_web::http::{StatusCode, header};
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
@@ -18,12 +19,20 @@ use crate::error::{Result, VcsError};
 use crate::repo::{Repository, TreeEdits};
 use crate::types::ChangedPathAction;
 
-/// Cap on concurrently open commit activities (abandoned MKACTIVITY sessions
-/// would otherwise leak memory indefinitely).
+/// Cap on concurrently open commit activities.
 const MAX_ACTIVITIES: usize = 256;
-/// Cap on bytes buffered in a single activity before it is committed. Bounds the
-/// memory a client can pin with PUT requests.
+/// Open activities per user, so one client cannot exhaust the global cap.
+const MAX_ACTIVITIES_PER_USER: usize = 16;
+/// An activity unused for this long is discarded (abandoned commits would
+/// otherwise pin memory and activity slots forever).
+const ACTIVITY_TTL: Duration = Duration::from_secs(60 * 60);
+/// Cap on bytes buffered in a single activity before it is committed.
 const MAX_ACTIVITY_BYTES: usize = 128 * 1024 * 1024;
+/// Cap on bytes buffered across all activities: bounds server memory no
+/// matter how many activities are open.
+const MAX_TOTAL_ACTIVITY_BYTES: usize = 512 * 1024 * 1024;
+/// Body limit for every request except PUT (XML bodies are small).
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// HTTP Basic auth realm advertised when a password file is configured.
 const AUTH_REALM: &str = "vcrs";
 /// Bound on remembered successful password checks (see `AppState::auth_cache`).
@@ -69,9 +78,20 @@ struct TxnActivity {
     deletes: BTreeSet<String>,
     /// Revision each touched path was based on (first touch wins).
     bases: BTreeMap<String, i64>,
+    /// Last time the activity was created or used (for expiry).
+    last_used: Option<Instant>,
 }
 
 impl TxnActivity {
+    fn buffered_bytes(&self) -> usize {
+        self.files.values().map(Vec::len).sum()
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.last_used
+            .is_some_and(|t| now.saturating_duration_since(t) > ACTIVITY_TTL)
+    }
+
     fn touched_paths(&self) -> impl Iterator<Item = &String> {
         self.files
             .keys()
@@ -104,9 +124,6 @@ pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Resu
             HttpServer::new(move || {
                 App::new()
                     .app_data(data.clone())
-                    // Allow request bodies up to the per-activity cap; the
-                    // activity accounting bounds total buffered memory.
-                    .app_data(web::PayloadConfig::new(MAX_ACTIVITY_BYTES))
                     .route("/{tail:.*}", web::to(svn_entry))
             })
             .bind(bind)?
@@ -165,7 +182,11 @@ fn check_bind_is_safe(bind: &str, options: &ServeOptions) -> Result<()> {
     }
 }
 
-async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState>) -> HttpResponse {
+async fn svn_entry(
+    req: HttpRequest,
+    payload: web::Payload,
+    state: web::Data<AppState>,
+) -> HttpResponse {
     let method = req.method().as_str().to_owned();
     let path = req.path().to_owned();
 
@@ -175,6 +196,21 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         Err(resp) => return resp,
     };
     let user = identity.name.as_str();
+
+    // The body is read only after authentication and with a per-method cap:
+    // small XML for everything but PUT, whose content is bounded again by the
+    // activity budgets.
+    let limit = if method == "PUT" {
+        MAX_ACTIVITY_BYTES
+    } else {
+        MAX_REQUEST_BYTES
+    };
+    let body = match payload.to_bytes_limited(limit).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => return HttpResponse::BadRequest().body("failed to read request body"),
+        Err(_) => return HttpResponse::PayloadTooLarge().body("request body too large"),
+    };
+
     let authz = match Authz::load(&state.repo_root) {
         Ok(authz) => authz,
         Err(err) => return svn_error_response(err),
@@ -257,13 +293,19 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
             let id = Uuid::new_v4().to_string();
             let activity = TxnActivity {
                 author: user.to_owned(),
+                last_used: Some(Instant::now()),
                 ..TxnActivity::default()
             };
-            if let Ok(mut map) = state.activities.lock() {
-                if map.len() >= MAX_ACTIVITIES {
-                    return HttpResponse::ServiceUnavailable().body("too many open activities");
+            match state.activities.lock() {
+                Ok(mut map) => {
+                    if let Err(reason) = admit_activity(&mut map, user, Instant::now()) {
+                        return HttpResponse::ServiceUnavailable().body(reason);
+                    }
+                    map.insert(id.clone(), activity);
                 }
-                map.insert(id.clone(), activity);
+                Err(_) => {
+                    return HttpResponse::InternalServerError().body("activity lock poisoned");
+                }
             }
             HttpResponse::Created()
                 .insert_header(("Location", format!("/!svn/act/{id}")))
@@ -310,18 +352,37 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                 Ok(m) => m,
                 Err(_) => return HttpResponse::InternalServerError().body("activity lock poisoned"),
             };
+            let now = Instant::now();
+            map.retain(|_, a| !a.expired(now));
+            let total_buffered: usize = map.values().map(TxnActivity::buffered_bytes).sum();
             let Some(activity) = map.get_mut(&activity_id) else {
                 return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
             };
             if activity.author != user {
                 return foreign_activity();
             }
+            activity.last_used = Some(now);
             let base_rev = *activity
                 .bases
                 .entry(rel.clone())
                 .or_insert_with(|| request_base_rev(&req, youngest));
             match method.as_str() {
-                "PUT" => put_into_activity(&req, &body, &state.repo_root, activity, rel, base_rev),
+                "PUT" => {
+                    // Memory other activities (and this path's previous
+                    // content) already hold counts against the global cap.
+                    let replaced = activity.files.get(&rel).map_or(0, Vec::len);
+                    let global_remaining = MAX_TOTAL_ACTIVITY_BYTES
+                        .saturating_sub(total_buffered.saturating_sub(replaced));
+                    put_into_activity(
+                        &req,
+                        &body,
+                        &state.repo_root,
+                        activity,
+                        rel,
+                        base_rev,
+                        global_remaining,
+                    )
+                }
                 "PROPPATCH" => {
                     // Setting properties supersedes a pending delete.
                     activity.deletes.remove(&rel);
@@ -476,6 +537,7 @@ fn put_into_activity(
     activity: &mut TxnActivity,
     rel: String,
     base_rev: i64,
+    global_remaining: usize,
 ) -> HttpResponse {
     // Bound the memory a single activity can pin across PUTs. Compute the
     // remaining budget up front so the svndiff expansion below is capped
@@ -486,7 +548,9 @@ fn put_into_activity(
         .filter(|(k, _)| **k != rel)
         .map(|(_, v)| v.len())
         .sum();
-    let remaining = MAX_ACTIVITY_BYTES.saturating_sub(buffered);
+    let remaining = MAX_ACTIVITY_BYTES
+        .saturating_sub(buffered)
+        .min(global_remaining);
 
     let ctype = req
         .headers()
@@ -511,6 +575,23 @@ fn put_into_activity(
     activity.deletes.remove(&rel);
     activity.files.insert(rel, data);
     HttpResponse::Created().finish()
+}
+
+/// Make room for a new activity of `user`: drop expired ones, then enforce the
+/// per-user and global caps.
+fn admit_activity(
+    map: &mut HashMap<String, TxnActivity>,
+    user: &str,
+    now: Instant,
+) -> std::result::Result<(), &'static str> {
+    map.retain(|_, a| !a.expired(now));
+    if map.values().filter(|a| a.author == user).count() >= MAX_ACTIVITIES_PER_USER {
+        return Err("too many open activities for this user");
+    }
+    if map.len() >= MAX_ACTIVITIES {
+        return Err("too many open activities");
+    }
+    Ok(())
 }
 
 fn foreign_activity() -> HttpResponse {
@@ -1673,6 +1754,35 @@ mod tests {
         alice.files.insert("a.txt".to_owned(), b"alice\n".to_vec());
         alice.bases.insert("a.txt".to_owned(), 2);
         assert_eq!(apply_activity_commit(root, alice, None, false).unwrap(), 3);
+    }
+
+    #[test]
+    fn activities_expire_and_are_capped_per_user() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let stale = now.checked_sub(ACTIVITY_TTL + Duration::from_secs(1));
+        for i in 0..MAX_ACTIVITIES_PER_USER {
+            map.insert(
+                format!("a{i}"),
+                TxnActivity {
+                    author: "mallory".to_owned(),
+                    last_used: Some(now),
+                    ..TxnActivity::default()
+                },
+            );
+        }
+        assert!(admit_activity(&mut map, "mallory", now).is_err());
+        // Other users are not locked out by one user's activities.
+        assert!(admit_activity(&mut map, "alice", now).is_ok());
+
+        // Abandoned activities disappear after the TTL.
+        if let Some(stale) = stale {
+            for a in map.values_mut() {
+                a.last_used = Some(stale);
+            }
+            assert!(admit_activity(&mut map, "mallory", now).is_ok());
+            assert!(map.is_empty());
+        }
     }
 
     #[test]
