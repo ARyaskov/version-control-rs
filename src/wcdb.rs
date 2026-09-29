@@ -5,7 +5,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::Result;
-use crate::types::{Commit, FileChange, FileEntry};
+use chrono::{DateTime, Utc};
+
+use crate::types::{ChangedPath, Commit, FileChange, FileEntry};
 
 /// Bump when the schema below changes so existing working copies re-run the
 /// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
@@ -69,6 +71,14 @@ pub struct ConflictRecord {
     pub old_file: Option<String>,
     pub new_file: Option<String>,
     pub mine_file: Option<String>,
+}
+
+/// A revision that changed a given path.
+#[derive(Debug, Clone)]
+pub struct RevisionTouch {
+    pub rev: i64,
+    pub author: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// One row of the revision index.
@@ -1029,6 +1039,37 @@ impl WcDb {
             .conn
             .prepare("SELECT commit_id FROM revisions ORDER BY rev DESC LIMIT 1")?;
         Ok(stmt.query_row([], |r| r.get(0)).optional()?)
+    }
+
+    /// Revisions up to `max_rev` whose change set mentions `path`, oldest
+    /// first, with their author and date (what blame needs to visit).
+    pub fn revisions_touching(&self, path: &str, max_rev: i64) -> Result<Vec<RevisionTouch>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rev, author, created_at, changed_paths_json FROM revisions WHERE rev<=?1 ORDER BY rev",
+        )?;
+        let rows = stmt.query_map(params![max_rev], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (rev, author, created_at, changed_json) = row?;
+            let changed: Vec<ChangedPath> = serde_json::from_str(&changed_json).unwrap_or_default();
+            if changed.iter().any(|c| c.path == path) {
+                out.push(RevisionTouch {
+                    rev,
+                    author,
+                    created_at: DateTime::parse_from_rfc3339(&created_at)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     pub fn merged_revisions_set(&self) -> Result<std::collections::BTreeSet<i64>> {

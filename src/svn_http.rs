@@ -56,6 +56,9 @@ pub struct ServeOptions {
 #[derive(Debug)]
 struct AppState {
     repo_root: PathBuf,
+    /// Opened once at startup (discovery runs crash recovery under the
+    /// repository lock; it must not happen on every request).
+    client: Client,
     options: ServeOptions,
     activities: Mutex<HashMap<String, TxnActivity>>,
     /// Serializes commit application (the repository lock also does, across
@@ -111,8 +114,10 @@ pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Resu
     validate_server_config(&repo_root)?;
     check_bind_is_safe(bind, &options)?;
 
+    let client = Client::discover(&repo_root)?;
     let data = web::Data::new(AppState {
         repo_root,
+        client,
         options,
         activities: Mutex::new(HashMap::new()),
         commit_lock: Mutex::new(()),
@@ -237,7 +242,8 @@ async fn svn_entry(
         }
     }
 
-    let youngest = youngest_rev(&state.repo_root).unwrap_or(0);
+    // HEAD's revision number comes straight from the revision index.
+    let youngest = state.client.head_revision().unwrap_or(0);
     let repo_root_header = "/";
     let repo_uuid = format!(
         "vcrs-{}",
@@ -273,11 +279,11 @@ async fn svn_entry(
             let xml = if payload.contains("get-latest-rev-report") {
                 latest_rev_report_xml(youngest)
             } else if payload.contains("log-report") {
-                log_report_response_xml(&state.repo_root, &authz, user)
+                log_report_response_xml(&state.client, &authz, user)
                     .unwrap_or_else(|_| empty_report_xml())
             } else if payload.contains("update-report") {
                 let from_rev = parse_update_target_rev(&body).unwrap_or(youngest);
-                update_report_xml(&state.repo_root, from_rev, youngest, &authz, user)
+                update_report_xml(&state.client, from_rev, youngest, &authz, user)
                     .unwrap_or_else(|_| empty_report_xml())
             } else {
                 empty_report_xml()
@@ -376,7 +382,7 @@ async fn svn_entry(
                     put_into_activity(
                         &req,
                         &body,
-                        &state.repo_root,
+                        &state.client,
                         activity,
                         rel,
                         base_rev,
@@ -472,10 +478,7 @@ async fn svn_entry(
             }
             // Repository-level locks live in SQLite: acquisition is atomic,
             // and commits by anyone else are refused while the lock is held.
-            let repo = match Repository::discover(&state.repo_root) {
-                Ok(r) => r,
-                Err(e) => return svn_error_response(e),
-            };
+            let repo = state.client.repository();
             if method == "UNLOCK" {
                 return match repo.unlock_path(&rel, user) {
                     Ok(()) => HttpResponse::NoContent().finish(),
@@ -499,11 +502,7 @@ async fn svn_entry(
                 if !authz.allows_rel(user, Action::Read, &rel) {
                     return svn_error_response(denied(user, &rel, Action::Read));
                 }
-                let client = match Client::discover(&state.repo_root) {
-                    Ok(c) => c,
-                    Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
-                };
-                match client.cat_revision_file(&rev.to_string(), &rel) {
+                match state.client.cat_revision_file(&rev.to_string(), &rel) {
                     Ok(bytes) => {
                         let mut res = HttpResponse::Ok();
                         res.insert_header((header::CONTENT_TYPE, "application/octet-stream"));
@@ -533,7 +532,7 @@ async fn svn_entry(
 fn put_into_activity(
     req: &HttpRequest,
     body: &[u8],
-    repo_root: &Path,
+    client: &Client,
     activity: &mut TxnActivity,
     rel: String,
     base_rev: i64,
@@ -560,7 +559,7 @@ fn put_into_activity(
     let data = if ctype.contains("svndiff") {
         // The delta is relative to the client's base revision, not to
         // whatever HEAD happens to be now.
-        let base = load_file_bytes_at(repo_root, &rel, base_rev).unwrap_or_default();
+        let base = load_file_bytes_at(client, &rel, base_rev).unwrap_or_default();
         match apply_svndiff_stream(&base, body, remaining) {
             Ok(v) => v,
             Err(err) => return svn_error_response(err),
@@ -1036,8 +1035,7 @@ fn parse_update_target_rev(xml: &[u8]) -> Option<i64> {
     min_rev
 }
 
-fn load_file_bytes_at(repo_root: &Path, rel: &str, rev: i64) -> Option<Vec<u8>> {
-    let client = Client::discover(repo_root).ok()?;
+fn load_file_bytes_at(client: &Client, rel: &str, rev: i64) -> Option<Vec<u8>> {
     client.cat_revision_file(&rev.to_string(), rel).ok()
 }
 
@@ -1274,11 +1272,6 @@ fn local_name(raw: &[u8]) -> &str {
     s.rsplit(':').next().unwrap_or(s)
 }
 
-fn youngest_rev(repo_root: &Path) -> Result<i64> {
-    let client = Client::discover(repo_root)?;
-    Ok(client.log(1)?.first().map(|c| c.revision).unwrap_or(0))
-}
-
 fn propfind_response_xml(path: &str, youngest: i64) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -1308,13 +1301,12 @@ fn latest_rev_report_xml(youngest: i64) -> String {
 }
 
 fn update_report_xml(
-    repo_root: &Path,
+    client: &Client,
     from_rev: i64,
     youngest: i64,
     authz: &Authz,
     user: &str,
 ) -> Result<String> {
-    let client = Client::discover(repo_root)?;
     if from_rev >= youngest {
         return Ok(format!(
             r#"<?xml version="1.0" encoding="utf-8"?><S:update-report xmlns:S="svn:"><S:target-revision rev="{}"/></S:update-report>"#,
@@ -1382,8 +1374,7 @@ fn update_report_xml(
     ))
 }
 
-fn log_report_response_xml(repo_root: &Path, authz: &Authz, user: &str) -> Result<String> {
-    let client = Client::discover(repo_root)?;
+fn log_report_response_xml(client: &Client, authz: &Authz, user: &str) -> Result<String> {
     let commits = client.log(20)?;
     let mut items = String::new();
     let reads_root = authz.allows(user, Action::Read, "/");

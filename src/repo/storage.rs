@@ -33,6 +33,8 @@ const ZSTD_LEVEL: i32 = 3;
 const TREE_HEADER: &[u8] = b"vcrs-tree-v1\0";
 /// Parsed trees kept in memory (they are immutable and content-addressed).
 const TREE_CACHE_LIMIT: usize = 4096;
+/// Parsed, verified commit records kept in memory.
+const COMMIT_CACHE_LIMIT: usize = 4096;
 
 /// Write `content` to `path` atomically and durably: write a uniquely-named
 /// temp file in the same directory, fsync it, rename it over the destination
@@ -370,18 +372,95 @@ pub fn read_commit(repo: &Repository, id: &str) -> Result<Commit> {
 /// tree-based commits): cheap enough for walking history.
 pub fn read_commit_header(repo: &Repository, id: &str) -> Result<Commit> {
     let path = commit_path(repo, id)?;
-    if !path.exists() {
+    let Ok(md) = fs::metadata(&path) else {
         return Err(VcsError::CommitNotFound(id.to_owned()));
+    };
+    // Commit files are immutable: a parsed, verified copy is reused as long as
+    // the file's size and mtime are unchanged (any rewrite is re-verified).
+    let stamp = (md.len(), md.modified().ok());
+    if let Some((cached_stamp, commit)) = commit_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&path).cloned())
+        && cached_stamp == stamp
+    {
+        return Ok((*commit).clone());
     }
-    let commit = parse_commit(&fs::read(path)?)?;
-    // The file must hold the commit it is named after, and (for verifiable
-    // formats) that commit must still hash to its id.
+    let commit = verify_commit_bytes(&fs::read(&path)?, id)?;
+    if let Ok(mut cache) = commit_cache().lock() {
+        if cache.len() >= COMMIT_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(path, (stamp, Arc::new(commit.clone())));
+    }
+    Ok(commit)
+}
+
+/// Parse a commit file's bytes and check that they hold commit `id`: the
+/// recorded id must match and, for verifiable formats, still be the hash of
+/// the record.
+fn verify_commit_bytes(bytes: &[u8], id: &str) -> Result<Commit> {
+    let commit = parse_commit(bytes)?;
     if commit.id != id
         || (commit.format >= COMMIT_FORMAT && compute_commit_id(&commit)? != commit.id)
     {
         return Err(VcsError::CorruptObject(id.to_owned()));
     }
     Ok(commit)
+}
+
+type CommitCache = HashMap<PathBuf, ((u64, Option<std::time::SystemTime>), Arc<Commit>)>;
+
+fn commit_cache() -> &'static Mutex<CommitCache> {
+    static CACHE: OnceLock<Mutex<CommitCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn commit_exists(repo: &Repository, id: &str) -> bool {
+    commit_path(repo, id).is_ok_and(|p| p.exists())
+}
+
+/// Copy commit `id` of `from` and the objects it needs into `to`. Objects are
+/// verified as they are read. A tree already present in `to` is complete
+/// (children are always stored before their parent), so it is not walked;
+/// the commit file is written last.
+pub fn transfer_commit(from: &Repository, to: &Repository, id: &str) -> Result<()> {
+    // Verify exactly the bytes that are copied.
+    let bytes =
+        fs::read(commit_path(from, id)?).map_err(|_| VcsError::CommitNotFound(id.to_owned()))?;
+    let commit = verify_commit_bytes(&bytes, id)?;
+    match &commit.tree {
+        Some(tree) => transfer_tree(from, to, tree)?,
+        None => {
+            for f in &commit.files {
+                copy_object(from, to, &f.blob_id)?;
+            }
+        }
+    }
+    ensure_layout(to)?;
+    atomic_write(&commit_path(to, id)?, &bytes)
+}
+
+fn transfer_tree(from: &Repository, to: &Repository, id: &str) -> Result<()> {
+    if object_exists(to, id) {
+        return Ok(());
+    }
+    for entry in &read_tree_object(from, id)?.entries {
+        match (&entry.tree, &entry.file) {
+            (Some(sub), _) => transfer_tree(from, to, sub)?,
+            (None, Some(file)) => copy_object(from, to, &file.blob_id)?,
+            (None, None) => {}
+        }
+    }
+    copy_object(from, to, id)
+}
+
+fn copy_object(from: &Repository, to: &Repository, id: &str) -> Result<()> {
+    if object_exists(to, id) {
+        return Ok(());
+    }
+    write_object(to, &read_object(from, id)?)?;
+    Ok(())
 }
 
 /// Deserialize a commit file and reject any path that could escape the

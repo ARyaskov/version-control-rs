@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 use crate::error::{Result, VcsError};
 use crate::repo::{PullOutcome, Repository, VCRS_DIR};
@@ -122,10 +121,12 @@ impl RaSession for FileRaSession {
         let _local_lock = local.lock()?;
         let _remote_lock = remote.lock()?;
 
-        copy_store(&remote.root, &local.root)?;
         let outcome = match remote.head_commit_id()? {
-            // Fast-forwards, or replays unpushed local commits on top.
-            Some(head) => local.integrate_remote_head(&head)?,
+            Some(head) => {
+                transfer_history(&remote, &local, &head)?;
+                // Fast-forwards, or replays unpushed local commits on top.
+                local.integrate_remote_head(&head)?
+            }
             None => PullOutcome::default(),
         };
         local.clear_local_lock_tokens()?;
@@ -166,7 +167,7 @@ impl RaSession for FileRaSession {
             )?;
         }
 
-        copy_store(&local.root, &remote.root)?;
+        transfer_history(&local, &remote, &local_head)?;
         remote.set_head_commit_id(&local_head)?;
         Ok(())
     }
@@ -195,36 +196,23 @@ fn resolve_remote_root(url: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(url))
 }
 
-fn copy_store(from_root: &Path, to_root: &Path) -> Result<()> {
-    let from_vcrs = from_root.join(VCRS_DIR);
-    let to_vcrs = to_root.join(VCRS_DIR);
-    fs::create_dir_all(&to_vcrs)?;
-    copy_tree(&from_vcrs.join("objects"), &to_vcrs.join("objects"))?;
-    copy_tree(&from_vcrs.join("commits"), &to_vcrs.join("commits"))?;
-    Ok(())
-}
-
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    if !from.exists() {
-        return Ok(());
-    }
-    for entry in WalkDir::new(from).follow_links(false) {
-        let entry = entry?;
-        let src = entry.path();
-        let rel = src
-            .strip_prefix(from)
-            .map_err(|_| VcsError::PathOutsideRepository(src.display().to_string()))?;
-        let dst = to.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&dst)?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if !dst.exists() {
-                fs::copy(src, dst)?;
-            }
+/// Copy the history ending at `head` from `from` to `to`: only the commits
+/// `to` lacks (walking back to the first one it has), oldest first, each with
+/// the objects it needs — verified on read, so corruption does not spread.
+/// Oldest-first order keeps the invariant that a present commit implies all
+/// of its ancestors are present, even if the transfer is interrupted.
+fn transfer_history(from: &Repository, to: &Repository, head: &str) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cur = Some(head.to_owned());
+    while let Some(id) = cur {
+        if to.has_commit(&id) {
+            break;
         }
+        cur = from.read_commit_header(&id)?.parent;
+        missing.push(id);
+    }
+    for id in missing.iter().rev() {
+        to.transfer_commit_from(from, id)?;
     }
     Ok(())
 }

@@ -1154,3 +1154,69 @@ fn ignored_directories_are_not_descended() {
     // `target` is not special without an ignore rule.
     assert_eq!(unversioned.unwrap(), vec!["target/out.txt".to_owned()]);
 }
+
+#[test]
+fn blame_restarts_after_delete_and_credits_merged_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "f.txt", "a\n");
+    add(&client, &["f.txt"]);
+    client.commit("r1", "ann").unwrap();
+    client.remove(&["f.txt".to_owned()], false).unwrap();
+    client.commit("r2 delete", "ann").unwrap();
+    write(root, "f.txt", "a\nb\n");
+    add(&client, &["f.txt"]);
+    client.commit("r3 re-add", "bob").unwrap();
+    let blame = client.blame("f.txt", None).unwrap();
+    assert!(blame.iter().all(|l| l.revision == 3), "{blame:?}");
+
+    // r4 adds a line, r5 reverts it (and shifts every line down), r6
+    // cherry-picks r4 back: the line is credited to its original author, not
+    // to the merge commit, although its line number differs from r4.
+    write(root, "f.txt", "a\nb\nc\n");
+    client.commit("r4", "carol").unwrap();
+    write(root, "f.txt", "z\na\nb\n");
+    client.commit("r5 revert", "dave").unwrap();
+    client.merge("4", false, false).unwrap();
+    client.commit("r6 re-apply r4", "erin").unwrap();
+    let blame = client.blame("f.txt", None).unwrap();
+    let c = blame.iter().find(|l| l.content == "c").unwrap();
+    assert_eq!((c.revision, c.author.as_str()), (4, "carol"));
+    let b = blame.iter().find(|l| l.content == "b").unwrap();
+    assert_eq!(b.revision, 3);
+}
+
+#[test]
+fn pull_transfers_only_reachable_verified_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_url, a, b) = two_clones(dir.path());
+    // Garbage in the remote store: an orphan commit and a corrupt object.
+    let srv = dir.path().join("srv/.vcrs");
+    fs::write(
+        srv.join("commits").join(format!("{}.json", "d".repeat(64))),
+        "{}",
+    )
+    .unwrap();
+    fs::create_dir_all(srv.join("objects/dd")).unwrap();
+    fs::write(
+        srv.join("objects/dd").join(format!("{}.z", "d".repeat(62))),
+        "junk",
+    )
+    .unwrap();
+
+    write(a.root(), "n.txt", "new\n");
+    add(&a, &["n.txt"]);
+    a.commit("A r2", "alice").unwrap();
+    a.push().unwrap();
+    b.pull().unwrap();
+    assert_eq!(read(b.root(), "n.txt"), "new\n");
+    let local = b.root().join(".vcrs");
+    assert!(
+        !local
+            .join("commits")
+            .join(format!("{}.json", "d".repeat(64)))
+            .exists()
+    );
+    assert!(!local.join("objects/dd").exists());
+}

@@ -3,10 +3,12 @@ mod storage;
 
 pub use lock::RepoLock;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use diffy::merge as diffy_merge;
@@ -25,6 +27,13 @@ use crate::wcdb::{
 };
 
 pub(crate) const VCRS_DIR: &str = ".vcrs";
+
+/// Working copies whose wc.db connection a thread keeps open.
+const DB_CACHE_LIMIT: usize = 8;
+
+thread_local! {
+    static DB_CACHE: RefCell<Vec<(PathBuf, Rc<WcDb>)>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Debug, Clone)]
 pub struct Repository {
@@ -193,6 +202,32 @@ impl Repository {
 
     pub fn read_commit(&self, id: &str) -> Result<Commit> {
         storage::read_commit(self, id)
+    }
+
+    /// Commit metadata of revision `rev` without its file list (cheap: the
+    /// tree is not expanded).
+    pub fn read_commit_header_by_revision(&self, rev: i64) -> Result<Commit> {
+        let commit_id = self
+            .wcdb()?
+            .commit_for_revision(rev)?
+            .ok_or_else(|| VcsError::RevisionNotFound(rev.to_string()))?;
+        let mut commit = storage::read_commit_header(self, &commit_id)?;
+        commit.files.clear();
+        Ok(commit)
+    }
+
+    pub(crate) fn has_commit(&self, id: &str) -> bool {
+        storage::commit_exists(self, id)
+    }
+
+    pub(crate) fn read_commit_header(&self, id: &str) -> Result<Commit> {
+        storage::read_commit_header(self, id)
+    }
+
+    /// Copy commit `id` and every object it needs from `from`, verifying each
+    /// object on the way.
+    pub(crate) fn transfer_commit_from(&self, from: &Repository, id: &str) -> Result<()> {
+        storage::transfer_commit(from, self, id)
     }
 
     pub fn read_commit_by_revision(&self, rev: i64) -> Result<Commit> {
@@ -485,7 +520,7 @@ impl Repository {
     /// The BASE revision's entry for `path`, if the file exists there.
     pub fn base_file_entry(&self, path: &str) -> Result<Option<FileEntry>> {
         Ok(self
-            .base_files(&self.wcdb()?)?
+            .base_files(&*self.wcdb()?)?
             .into_iter()
             .find(|f| f.path == path))
     }
@@ -1064,6 +1099,8 @@ impl Repository {
         )
     }
 
+    /// The newest `limit` commits, newest first. Only metadata is loaded:
+    /// `files` is empty (use [`Repository::read_commit`] for file lists).
     pub fn log(&self, limit: usize) -> Result<Vec<Commit>> {
         let mut out = Vec::new();
         let mut next = self.head_commit_id()?;
@@ -1072,7 +1109,8 @@ impl Repository {
             if out.len() >= limit {
                 break;
             }
-            let commit = storage::read_commit(self, &id)?;
+            let mut commit = storage::read_commit_header(self, &id)?;
+            commit.files.clear();
             next = commit.parent.clone();
             out.push(commit);
         }
@@ -1106,7 +1144,7 @@ impl Repository {
                 rev -= 1;
                 continue;
             }
-            if let Ok(mut commit) = self.read_commit_by_revision(rev) {
+            if let Ok(mut commit) = self.read_commit_header_by_revision(rev) {
                 if !verbose_paths {
                     commit.changed_files.clear();
                     commit.changed_paths.clear();
@@ -1278,7 +1316,7 @@ impl Repository {
         let target_rev = self.resolve_revision_spec(revision)?;
         let target = self.read_commit_by_revision(target_rev)?;
         let outcome = self.apply_tree_delta(
-            &self.base_files(&self.wcdb()?)?,
+            &self.base_files(&*self.wcdb()?)?,
             &target.files,
             Some(&target),
             None,
@@ -1294,12 +1332,12 @@ impl Repository {
 
     pub fn commit_changed_files(&self, revision: &str) -> Result<Vec<FileChange>> {
         let rev = self.resolve_revision_spec(revision)?;
-        Ok(self.read_commit_by_revision(rev)?.changed_files)
+        Ok(self.read_commit_header_by_revision(rev)?.changed_files)
     }
 
     pub fn commit_changed_paths(&self, revision: &str) -> Result<Vec<ChangedPath>> {
         let rev = self.resolve_revision_spec(revision)?;
-        Ok(self.read_commit_by_revision(rev)?.changed_paths)
+        Ok(self.read_commit_header_by_revision(rev)?.changed_paths)
     }
 
     pub fn blame_file(&self, path: &str, revision: Option<&str>) -> Result<Vec<BlameLine>> {
@@ -1315,14 +1353,21 @@ impl Repository {
         Ok(lines)
     }
 
+    /// Line attribution of `path` at `target_rev`. Only revisions whose change
+    /// set mentions the path are visited (and only the trees along the path
+    /// are read); a deletion ends the file's history, so a later re-addition
+    /// starts fresh.
     fn blame_file_at_revision(&self, path: &str, target_rev: i64) -> Result<Vec<BlameLine>> {
         let mut previous_lines: Vec<String> = Vec::new();
         let mut attributions: Vec<BlameLine> = Vec::new();
         let mut seen_any = false;
 
-        for rev in 1..=target_rev {
-            let commit = self.read_commit_by_revision(rev)?;
-            let Some(file) = commit.files.iter().find(|f| f.path == path) else {
+        for touch in self.wcdb()?.revisions_touching(path, target_rev)? {
+            let rev = touch.rev;
+            let Some(file) = self.file_entry_at_revision(rev, path)? else {
+                previous_lines.clear();
+                attributions.clear();
+                seen_any = false;
                 continue;
             };
             if file.is_binary {
@@ -1335,39 +1380,22 @@ impl Repository {
             let new_lines: Vec<String> = text.lines().map(|s| s.to_owned()).collect();
 
             if !seen_any {
-                if let (Some(src_path), Some(src_rev)) = (&file.copy_from_path, file.copy_from_rev)
-                {
-                    if src_rev > 0 {
+                attributions = match (&file.copy_from_path, file.copy_from_rev) {
+                    (Some(src_path), Some(src_rev)) if src_rev > 0 => {
                         let src_blame = self.blame_file_at_revision(src_path, src_rev)?;
-                        let src_text = self
-                            .file_entry_at_revision(src_rev, src_path)?
-                            .map(|e| self.read_blob(&e.blob_id))
-                            .transpose()?
-                            .map(|b| String::from_utf8_lossy(&b).to_string())
-                            .unwrap_or_default();
                         let src_lines: Vec<String> =
-                            src_text.lines().map(|s| s.to_owned()).collect();
-                        let rebased = apply_diff_to_blame(
+                            src_blame.iter().map(|l| l.content.clone()).collect();
+                        apply_diff_to_blame(
                             &src_blame,
                             &src_lines,
                             &new_lines,
-                            &commit.author,
+                            &touch.author,
                             rev,
-                            commit.created_at,
-                        );
-                        attributions = rebased;
-                    } else {
-                        attributions = base_blame_for_lines(
-                            &new_lines,
-                            rev,
-                            &commit.author,
-                            commit.created_at,
-                        );
+                            touch.created_at,
+                        )
                     }
-                } else {
-                    attributions =
-                        base_blame_for_lines(&new_lines, rev, &commit.author, commit.created_at);
-                }
+                    _ => base_blame_for_lines(&new_lines, rev, &touch.author, touch.created_at),
+                };
                 previous_lines = new_lines;
                 seen_any = true;
                 continue;
@@ -1377,9 +1405,9 @@ impl Repository {
                 &attributions,
                 &previous_lines,
                 &new_lines,
-                &commit.author,
+                &touch.author,
                 rev,
-                commit.created_at,
+                touch.created_at,
             );
             previous_lines = new_lines;
         }
@@ -1387,42 +1415,39 @@ impl Repository {
         Ok(attributions)
     }
 
+    /// Credit merged lines to the revision that wrote them. A line attributed
+    /// to a merge commit that also exists — aligned by diff, not by line
+    /// number — in the merged revision's version of the file takes that
+    /// version's attribution.
     fn apply_merge_awareness(
         &self,
         path: &str,
         target_rev: i64,
         lines: &mut [BlameLine],
     ) -> Result<()> {
-        let edges = self.wcdb()?.merge_edges_up_to(target_rev)?;
-        if edges.is_empty() {
-            return Ok(());
-        }
-        for (_target, merged_rev, source_path) in edges {
-            let source_file = if source_path == "/" || source_path.is_empty() {
-                path.to_owned()
-            } else {
-                if !path_in_scope(path, &source_path) {
-                    continue;
-                }
-                path.to_owned()
-            };
-            let Some(entry) = self.file_entry_at_revision(merged_rev, &source_file)? else {
-                continue;
-            };
-            if entry.is_binary {
+        for (merge_rev, merged_rev, source_path) in self.wcdb()?.merge_edges_up_to(target_rev)? {
+            if !path_in_scope(path, &source_path) || !lines.iter().any(|l| l.revision == merge_rev)
+            {
                 continue;
             }
-            let text = String::from_utf8_lossy(&self.read_blob(&entry.blob_id)?).to_string();
-            let src_lines: Vec<&str> = text.lines().collect();
-            let merged_commit = self.read_commit_by_revision(merged_rev)?;
-            for (idx, line) in lines.iter_mut().enumerate() {
-                let Some(src_line) = src_lines.get(idx).copied() else {
+            let Ok(source) = self.blame_file_at_revision(path, merged_rev) else {
+                continue;
+            };
+            let source_text: Vec<&str> = source.iter().map(|l| l.content.as_str()).collect();
+            let current_text: Vec<String> = lines.iter().map(|l| l.content.clone()).collect();
+            let current_text: Vec<&str> = current_text.iter().map(String::as_str).collect();
+            for op in capture_diff_slices(Algorithm::Myers, &source_text, &current_text) {
+                if op.tag() != DiffTag::Equal {
                     continue;
-                };
-                if line.content == src_line && merged_rev < line.revision {
-                    line.revision = merged_rev;
-                    line.author = merged_commit.author.clone();
-                    line.created_at = merged_commit.created_at;
+                }
+                for (src_idx, cur_idx) in op.old_range().zip(op.new_range()) {
+                    let line = &mut lines[cur_idx];
+                    if line.revision == merge_rev {
+                        let origin = &source[src_idx];
+                        line.revision = origin.revision;
+                        line.author = origin.author.clone();
+                        line.created_at = origin.created_at;
+                    }
                 }
             }
         }
@@ -1807,8 +1832,27 @@ impl Repository {
         self.wcdb()?.list_externals()
     }
 
-    fn wcdb(&self) -> Result<WcDb> {
-        WcDb::open(&self.root)
+    /// The working copy's database connection. Connections are cached per
+    /// thread and working copy: opening SQLite and checking the schema on
+    /// every call dominated small operations.
+    fn wcdb(&self) -> Result<Rc<WcDb>> {
+        DB_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(pos) = cache.iter().position(|(root, _)| root == &self.root) {
+                // A working copy deleted and re-created at the same path gets
+                // a fresh connection.
+                if self.root.join(VCRS_DIR).join("wc.db").exists() {
+                    return Ok(cache[pos].1.clone());
+                }
+                cache.remove(pos);
+            }
+            let db = Rc::new(WcDb::open(&self.root)?);
+            if cache.len() >= DB_CACHE_LIMIT {
+                cache.remove(0);
+            }
+            cache.push((self.root.clone(), db.clone()));
+            Ok(db)
+        })
     }
 
     /// Append a hook failure to `.vcrs/hooks.log` (best effort).
@@ -1922,7 +1966,7 @@ impl Repository {
             if out.contains(&id) {
                 return Err(VcsError::Protocol(format!("cycle in history at {id}")));
             }
-            cur = storage::read_commit(self, &id)?.parent;
+            cur = storage::read_commit_header(self, &id)?.parent;
             out.push(id);
         }
         Ok(out)
@@ -2137,7 +2181,7 @@ impl Repository {
             if !seen.insert(id.clone()) {
                 return Err(VcsError::Protocol(format!("cycle in history at {id}")));
             }
-            let c = storage::read_commit(self, &id)?;
+            let c = storage::read_commit_header(self, &id)?;
             cur = c.parent.clone();
             chain.push(c);
         }

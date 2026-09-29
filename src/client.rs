@@ -77,6 +77,16 @@ impl Client {
         self
     }
 
+    /// The underlying repository.
+    pub fn repository(&self) -> &Repository {
+        &self.repo
+    }
+
+    /// Revision number of HEAD (0 for an empty repository).
+    pub fn head_revision(&self) -> Result<i64> {
+        self.repo.wcdb_head_rev()
+    }
+
     pub fn root(&self) -> &Path {
         &self.repo.root
     }
