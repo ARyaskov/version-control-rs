@@ -4,7 +4,7 @@ use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use version_control_rs::{
-    ChangeKind, ChangedPathAction, Client, Depth, FileChange, Result, VcsError,
+    ChangeKind, ChangedPathAction, Client, Depth, FileChange, ResolveAccept, Result, VcsError,
 };
 
 #[derive(Parser, Debug)]
@@ -48,6 +48,8 @@ enum Commands {
     #[command(alias = "up")]
     Update(UpdateArgs),
     Changed(ChangedArgs),
+    /// Mark conflicts as resolved.
+    Resolve(ResolveArgs),
     Merge(MergeArgs),
     Stage(StageArgs),
     Unstage(StageArgs),
@@ -182,6 +184,15 @@ struct MergeArgs {
 #[derive(Args, Debug)]
 struct StageArgs {
     paths: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct ResolveArgs {
+    /// Conflicted paths (all conflicts when omitted).
+    paths: Vec<String>,
+    /// Content to keep: working, mine-full, theirs-full or base.
+    #[arg(long, default_value = "working")]
+    accept: String,
 }
 
 #[derive(Args, Debug)]
@@ -366,6 +377,29 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 for p in removed {
                     println!("D  {p}");
+                }
+            }
+        }
+        Commands::Resolve(args) => {
+            let client = Client::discover(".")?;
+            let accept = match args.accept.as_str() {
+                "working" => ResolveAccept::Working,
+                "mine-full" => ResolveAccept::MineFull,
+                "theirs-full" => ResolveAccept::TheirsFull,
+                "base" => ResolveAccept::Base,
+                other => {
+                    return Err(VcsError::Protocol(format!(
+                        "unknown --accept value '{other}' (expected working, mine-full, theirs-full or base)"
+                    )));
+                }
+            };
+            let paths = repo_paths(&client, &args.paths)?;
+            let resolved = client.resolve(&paths, accept)?;
+            if json_output {
+                print_json(json!({"ok": true, "command": "resolve", "resolved": resolved}))?;
+            } else {
+                for p in resolved {
+                    println!("Resolved conflict on {p}");
                 }
             }
         }
@@ -703,6 +737,12 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("Updated to {}", args.revision);
                 println!("Applied {} change(s)", changed.len());
+                for (path, c) in client.conflicts()? {
+                    println!(
+                        "  C {path} ({})",
+                        c.reason.as_deref().unwrap_or("text conflict")
+                    );
+                }
             }
         }
         Commands::Changed(args) => {
@@ -1174,6 +1214,9 @@ fn format_status_line(ch: &FileChange) -> String {
 }
 
 fn text_status_char(ch: &FileChange) -> char {
+    if ch.conflicted {
+        return 'C';
+    }
     match ch.kind {
         ChangeKind::Added => 'A',
         ChangeKind::Deleted => 'D',

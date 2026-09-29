@@ -9,7 +9,7 @@ use crate::types::{Commit, FileChange, FileEntry};
 
 /// Bump when the schema below changes so existing working copies re-run the
 /// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub struct WcDb {
@@ -29,6 +29,17 @@ pub enum ScheduleOp {
 pub struct Scheduled {
     pub op: ScheduleOp,
     pub copy_from: Option<String>,
+}
+
+/// An unresolved conflict: `kind` is `text` (with artifact files, paths
+/// relative to the working-copy root) or `tree` (with a `reason`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConflictRecord {
+    pub kind: String,
+    pub reason: Option<String>,
+    pub old_file: Option<String>,
+    pub new_file: Option<String>,
+    pub mine_file: Option<String>,
 }
 
 /// One row of the revision index.
@@ -212,6 +223,15 @@ impl WcDb {
                 owner TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS conflicts (
+                path TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                reason TEXT,
+                old_file TEXT,
+                new_file TEXT,
+                mine_file TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS schedule (
                 path TEXT PRIMARY KEY,
                 op TEXT NOT NULL,
@@ -386,43 +406,60 @@ impl WcDb {
     pub fn set_tree_conflict(&self, path: &str, reason: &str) -> Result<()> {
         self.with_write_tx(|tx| {
             tx.execute(
-                "INSERT INTO actual_node(path,text_mod,prop_mod,tree_conflict)
-                 VALUES(?1,0,0,?2)
-                 ON CONFLICT(path) DO UPDATE SET tree_conflict=excluded.tree_conflict",
+                "INSERT OR REPLACE INTO conflicts(path, kind, reason, old_file, new_file, mine_file)
+                 VALUES(?1, 'tree', ?2, NULL, NULL, NULL)",
                 params![path, reason],
             )?;
             Ok(())
         })
     }
 
-    pub fn set_text_conflict_markers(
+    pub fn set_text_conflict(
         &self,
         path: &str,
-        old_marker: &str,
-        new_marker: &str,
-        working_marker: &str,
+        old_file: &str,
+        new_file: &str,
+        mine_file: &str,
     ) -> Result<()> {
         self.with_write_tx(|tx| {
             tx.execute(
-                "INSERT INTO actual_node(path,text_mod,prop_mod,conflict_old,conflict_new,conflict_working)
-                 VALUES(?1,1,0,?2,?3,?4)
-                 ON CONFLICT(path) DO UPDATE SET
-                   text_mod=1,
-                   conflict_old=excluded.conflict_old,
-                   conflict_new=excluded.conflict_new,
-                   conflict_working=excluded.conflict_working",
-                params![path, old_marker, new_marker, working_marker],
+                "INSERT OR REPLACE INTO conflicts(path, kind, reason, old_file, new_file, mine_file)
+                 VALUES(?1, 'text', NULL, ?2, ?3, ?4)",
+                params![path, old_file, new_file, mine_file],
             )?;
             Ok(())
         })
     }
 
-    pub fn clear_conflicts(&self) -> Result<()> {
+    /// Unresolved conflicts. Kept in their own table so refreshing the node
+    /// tables (every status) can never drop them.
+    pub fn conflicts(&self) -> Result<BTreeMap<String, ConflictRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, kind, reason, old_file, new_file, mine_file FROM conflicts")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ConflictRecord {
+                    kind: r.get(1)?,
+                    reason: r.get(2)?,
+                    old_file: r.get(3)?,
+                    new_file: r.get(4)?,
+                    mine_file: r.get(5)?,
+                },
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (path, record) = row?;
+            out.insert(path, record);
+        }
+        Ok(out)
+    }
+
+    pub fn clear_conflict(&self, path: &str) -> Result<()> {
         self.with_write_tx(|tx| {
-            tx.execute(
-                "UPDATE actual_node SET conflict_old=NULL, conflict_new=NULL, conflict_working=NULL, tree_conflict=NULL",
-                [],
-            )?;
+            tx.execute("DELETE FROM conflicts WHERE path=?1", params![path])?;
             Ok(())
         })
     }

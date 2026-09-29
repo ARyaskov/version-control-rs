@@ -12,8 +12,10 @@ SVN-like version control engine in Rust (library + CLI).
   - `ignore_rules`, `externals`, `file_props`
 - Commit/update/status/diff/revert with revision-aware behavior
 - Out-of-date commit protection (`base rN` vs `head rN`)
-- 3-way merge baseline with conflict artifacts:
-  - `.mine`, `.rOLD`, `.rNEW`
+- 3-way merge on update/merge: non-overlapping edits merge cleanly; overlapping
+  ones leave conflict markers plus `.mine`, `.rOLD`, `.rNEW` artifacts. Conflicts
+  are recorded in wc.db (`C` in `status`), block commits and further updates of
+  the working copy until `vcrs resolve`.
 - Properties (`prop-set`, `prop-get`, `prop-del`)
 - Ignore rules (`ignore add/list`) and externals metadata (`externals set/list`)
 - Log by range with verbose changed paths (`log -r N:M -v`)
@@ -64,6 +66,7 @@ vcrs blame src/main.rs -r 7
 vcrs update -r HEAD
 vcrs revert [optional/path ...]
 vcrs merge -r 7 [--dry-run] [--record-only]
+vcrs resolve src/main.rs [--accept working|mine-full|theirs-full|base]
 vcrs lock path/to/file
 vcrs unlock path/to/file
 vcrs copy src/lib.rs src/lib_copy.rs
@@ -126,7 +129,7 @@ BASE and un-schedules additions (the files stay on disk, unversioned).
 - Working copy and remotes: `init`, `checkout`, `switch`, `pull`, `push`
 - Local file operations: `add`, `rm`, `copy`, `move`, `revert`, `lock`, `unlock`
 - Inspection: `status`, `staged`, `diff`, `cat`, `log`, `changed`, `blame`, `hunks`
-- History and integration: `commit`, `update`, `merge`
+- History and integration: `commit`, `update`, `merge`, `resolve`
 - Properties and grouping: `prop-set`, `prop-get`, `prop-del`, `iprop-set`, `iprop-list`, `changelist set|clear|list`
 - Metadata rules: `ignore add|list`, `externals set|list`
 - Server mode: `serve-http`

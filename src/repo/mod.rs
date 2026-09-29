@@ -20,7 +20,7 @@ use crate::types::{
     BlameLine, ChangeKind, ChangedPath, ChangedPathAction, Commit, Depth, FileChange, FileEntry,
     RevisionRange,
 };
-use crate::wcdb::{ExternalDef, RevisionRow, ScheduleOp, Scheduled, WcDb};
+use crate::wcdb::{ConflictRecord, ExternalDef, RevisionRow, ScheduleOp, Scheduled, WcDb};
 
 pub(crate) const VCRS_DIR: &str = ".vcrs";
 
@@ -36,6 +36,19 @@ pub struct Repository {
 pub struct MergeOutcome {
     pub changed: Vec<FileChange>,
     pub conflicts: Vec<String>,
+}
+
+/// Which content `resolve` keeps for a text conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveAccept {
+    /// The file as it is now (after manual editing).
+    Working,
+    /// The local version from before the merge (`.mine`).
+    MineFull,
+    /// The incoming version (`.rNEW`).
+    TheirsFull,
+    /// The common ancestor (`.rOLD`).
+    Base,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -612,8 +625,14 @@ impl Repository {
             }));
         }
 
-        // Refuse to record unresolved conflict markers (svn blocks this too).
-        let mut conflicted = Vec::new();
+        // Refuse to commit paths with a recorded, unresolved conflict, and
+        // (as a safety net) text that still contains conflict markers.
+        let recorded = wcdb.conflicts()?;
+        let mut conflicted: Vec<String> = changed
+            .iter()
+            .filter(|ch| recorded.contains_key(&ch.path))
+            .map(|ch| ch.path.clone())
+            .collect();
         for ch in &changed {
             if ch.kind == ChangeKind::Deleted || ch.is_binary || !ch.text_modified {
                 continue;
@@ -1553,8 +1572,15 @@ impl Repository {
         let mut conflicts = Vec::new();
         let mut planned: Vec<FileChange> = Vec::new();
 
+        // The working copy has a single BASE revision, so a path cannot be
+        // skipped while BASE moves on: unresolved conflicts must go first.
         if !dry_run {
-            wcdb.clear_conflicts()?;
+            let pending = wcdb.conflicts()?;
+            if !pending.is_empty() {
+                return Err(VcsError::UnresolvedConflicts {
+                    paths: pending.into_keys().collect::<Vec<_>>().join(", "),
+                });
+            }
         }
 
         for path in &keys {
@@ -1606,44 +1632,16 @@ impl Repository {
             }
 
             if local_changed && changed_entry(w, t) {
-                // conflict
                 if dry_run {
                     conflicts.push(path.to_string());
                     planned.push(incoming_change(path, b, t));
                     continue;
                 }
-                if let (Some(be), Some(we), Some(te)) = (b, w, t) {
-                    if !(be.is_binary || we.is_binary || te.is_binary) {
-                        // Working content is not persisted by the snapshot, so
-                        // recompute its repository form from disk.
-                        let working_bytes = self.normalized_working_bytes(path)?;
-                        let merged = three_way_merge_text(
-                            &String::from_utf8_lossy(&self.read_blob(&be.blob_id)?),
-                            &String::from_utf8_lossy(&working_bytes),
-                            &String::from_utf8_lossy(&self.read_blob(&te.blob_id)?),
-                        );
-
-                        let abs = self.abs_path(path)?;
-                        if let Some(parent) = abs.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        let mine_path = write_sibling(&abs, ".mine", &working_bytes)?;
-                        let old_path = write_sibling(&abs, ".rOLD", &self.read_blob(&be.blob_id)?)?;
-                        let new_path = write_sibling(&abs, ".rNEW", &self.read_blob(&te.blob_id)?)?;
-                        remove_path_if_exists(&abs)?;
-                        fs::write(&abs, merged.as_bytes())?;
-
-                        wcdb.set_text_conflict_markers(path, &old_path, &new_path, &mine_path)?;
-                        conflicts.push(path.to_string());
-                        continue;
-                    }
+                if self.merge_or_conflict(&wcdb, path, b, w, t, advance_base)? {
+                    planned.push(incoming_change(path, b, t));
+                } else {
+                    conflicts.push(path.to_string());
                 }
-
-                let local_op = op_kind(b, w);
-                let incoming_op = op_kind(b, t);
-                let reason = classify_tree_conflict(local_op, incoming_op);
-                wcdb.set_tree_conflict(path, &reason)?;
-                conflicts.push(path.to_string());
                 continue;
             }
 
@@ -1691,7 +1689,9 @@ impl Repository {
             });
         }
 
-        if conflicts.is_empty() && advance_base {
+        // BASE moves even when conflicts were recorded (as in svn): conflicted
+        // paths carry their merge state and block commits until resolved.
+        if advance_base {
             wcdb.set_base_revision(rev)?;
             reconcile_schedule(&wcdb, target_files)?;
         }
@@ -1700,6 +1700,157 @@ impl Repository {
             changed: planned,
             conflicts,
         })
+    }
+
+    /// Combine a local change `w` and an incoming change `t` (both relative to
+    /// `b`). Text content is merged three-way: a clean merge is written and
+    /// returns `true`; overlapping edits leave conflict markers plus
+    /// `.mine`/`.rOLD`/`.rNEW` artifacts. Binary content keeps the local file
+    /// with the same artifacts, and structural clashes (edit vs delete, ...)
+    /// become tree conflicts. Every conflict is recorded in wc.db and blocks
+    /// commits of that path until `resolve`.
+    fn merge_or_conflict(
+        &self,
+        wcdb: &WcDb,
+        path: &str,
+        b: Option<&FileEntry>,
+        w: Option<&FileEntry>,
+        t: Option<&FileEntry>,
+        advance_base: bool,
+    ) -> Result<bool> {
+        let abs = self.abs_path(path)?;
+        match (w, t) {
+            (Some(we), Some(te)) if we.blob_id == te.blob_id => {
+                // Same content, different properties on both sides.
+                wcdb.set_tree_conflict(path, "property conflict")?;
+                Ok(false)
+            }
+            (Some(we), Some(te)) => {
+                let base = match b {
+                    Some(be) => self.read_blob(&be.blob_id)?,
+                    None => Vec::new(),
+                };
+                let mine = self.normalized_working_bytes(path)?;
+                let theirs = self.read_blob(&te.blob_id)?;
+                let binary = we.is_binary || te.is_binary || b.is_some_and(|x| x.is_binary);
+                if !binary
+                    && let (Ok(base_s), Ok(mine_s), Ok(theirs_s)) = (
+                        std::str::from_utf8(&base),
+                        std::str::from_utf8(&mine),
+                        std::str::from_utf8(&theirs),
+                    )
+                {
+                    let (merged, clean) = three_way_merge_text(base_s, mine_s, theirs_s);
+                    if clean {
+                        remove_path_if_exists(&abs)?;
+                        fs::write(&abs, merged.as_bytes())?;
+                        return Ok(true);
+                    }
+                    self.write_conflict_artifacts(path, &abs, &base, &mine, &theirs)?;
+                    remove_path_if_exists(&abs)?;
+                    fs::write(&abs, merged.as_bytes())?;
+                } else {
+                    // Binary: the working file keeps the local version.
+                    self.write_conflict_artifacts(path, &abs, &base, &mine, &theirs)?;
+                }
+                wcdb.set_text_conflict(
+                    path,
+                    &format!("{path}.rOLD"),
+                    &format!("{path}.rNEW"),
+                    &format!("{path}.mine"),
+                )?;
+                Ok(false)
+            }
+            (Some(_), None) => {
+                // Local edit, incoming delete: keep the edited file versioned.
+                if advance_base {
+                    wcdb.set_schedule(path, ScheduleOp::Add, None)?;
+                }
+                wcdb.set_tree_conflict(path, "local edit, incoming delete")?;
+                Ok(false)
+            }
+            (None, _) => {
+                let reason = classify_tree_conflict(op_kind(b, w), op_kind(b, t));
+                wcdb.set_tree_conflict(path, &reason)?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn write_conflict_artifacts(
+        &self,
+        path: &str,
+        abs: &Path,
+        base: &[u8],
+        mine: &[u8],
+        theirs: &[u8],
+    ) -> Result<()> {
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Artifact names derive from a validated path; re-validate the full
+        // sibling names anyway before writing.
+        for suffix in [".mine", ".rOLD", ".rNEW"] {
+            crate::path::validate_rel_path(&format!("{path}{suffix}"))?;
+        }
+        write_sibling(abs, ".mine", mine)?;
+        write_sibling(abs, ".rOLD", base)?;
+        write_sibling(abs, ".rNEW", theirs)?;
+        Ok(())
+    }
+
+    /// Unresolved conflicts recorded in the working copy.
+    pub fn conflicts(&self) -> Result<BTreeMap<String, ConflictRecord>> {
+        self.wcdb()?.conflicts()
+    }
+
+    /// Mark conflicts on `paths` (all when empty) as resolved, choosing the
+    /// content to keep, and delete the conflict artifacts.
+    pub fn resolve(&self, paths: &[String], accept: ResolveAccept) -> Result<Vec<String>> {
+        let _lock = self.lock()?;
+        let wcdb = self.wcdb()?;
+        let conflicts = wcdb.conflicts()?;
+        let selected: Vec<(&String, &ConflictRecord)> = conflicts
+            .iter()
+            .filter(|(p, _)| paths.is_empty() || paths.iter().any(|o| path_in_scope(p, o)))
+            .collect();
+        if selected.is_empty() && !paths.is_empty() {
+            return Err(VcsError::NotVersioned(paths.join(", ")));
+        }
+        let mut resolved = Vec::new();
+        for (path, record) in selected {
+            let artifacts = [&record.mine_file, &record.old_file, &record.new_file];
+            let chosen = match accept {
+                ResolveAccept::Working => None,
+                ResolveAccept::MineFull => record.mine_file.as_ref(),
+                ResolveAccept::TheirsFull => record.new_file.as_ref(),
+                ResolveAccept::Base => record.old_file.as_ref(),
+            };
+            if accept != ResolveAccept::Working {
+                let Some(source) = chosen else {
+                    return Err(VcsError::TreeConflict {
+                        path: path.clone(),
+                        reason: format!(
+                            "{}; only --accept working applies to tree conflicts",
+                            record.reason.as_deref().unwrap_or("tree conflict")
+                        ),
+                    });
+                };
+                let content = fs::read(self.abs_path(source)?)?;
+                let abs = self.abs_path(path)?;
+                remove_path_if_exists(&abs)?;
+                fs::write(&abs, content)?;
+            }
+            for artifact in artifacts.into_iter().flatten() {
+                if let Ok(abs) = self.abs_path(artifact) {
+                    remove_path_if_exists(&abs)?;
+                }
+            }
+            wcdb.clear_conflict(path)?;
+            resolved.push(path.clone());
+        }
+        self.sync_wcdb()?;
+        Ok(resolved)
     }
 
     fn sync_wcdb(&self) -> Result<()> {
@@ -1723,6 +1874,7 @@ impl Repository {
             .collect();
         let mut changes = compute_changed_files(Some(&base_files), working);
         apply_scheduled_copies(&mut changes, &schedule);
+        mark_conflicts(&mut changes, &wcdb.conflicts()?);
         wcdb.replace_nodes(&base_files, working, &changes)?;
         wcdb.replace_file_props_from_entries(working)?;
         Ok(changes)
@@ -1809,6 +1961,30 @@ fn reconcile_schedule(wcdb: &WcDb, new_base: &[FileEntry]) -> Result<()> {
     wcdb.clear_schedule(&stale)
 }
 
+/// Flag conflicted paths in a change set; a conflicted path without a content
+/// change (e.g. a tree conflict whose file matches BASE) is still listed.
+fn mark_conflicts(changes: &mut Vec<FileChange>, conflicts: &BTreeMap<String, ConflictRecord>) {
+    for ch in changes.iter_mut() {
+        ch.conflicted = conflicts.contains_key(&ch.path);
+    }
+    for path in conflicts.keys() {
+        if !changes.iter().any(|c| &c.path == path) {
+            changes.push(FileChange {
+                path: path.clone(),
+                kind: ChangeKind::Modified,
+                text_modified: false,
+                props_modified: false,
+                is_binary: false,
+                copy_from: None,
+                moved_from: None,
+                moved_to: None,
+                conflicted: true,
+            });
+        }
+    }
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+}
+
 /// Explicit copy/move records (from `copy`/`move`) win over the content-based
 /// rename/copy heuristics.
 fn apply_scheduled_copies(changes: &mut [FileChange], schedule: &BTreeMap<String, Scheduled>) {
@@ -1872,6 +2048,7 @@ pub(crate) fn compute_changed_files(
                     copy_from: None,
                     moved_from: None,
                     moved_to: None,
+                    conflicted: false,
                 });
                 added_by_blob
                     .entry(newf.blob_id.clone())
@@ -1889,6 +2066,7 @@ pub(crate) fn compute_changed_files(
                     copy_from: None,
                     moved_from: None,
                     moved_to: None,
+                    conflicted: false,
                 });
                 deleted_by_blob
                     .entry(oldf.blob_id.clone())
@@ -1909,6 +2087,7 @@ pub(crate) fn compute_changed_files(
                         copy_from: None,
                         moved_from: None,
                         moved_to: None,
+                        conflicted: false,
                     });
                 }
             }
@@ -2076,10 +2255,12 @@ fn changed_entry(a: Option<&FileEntry>, b: Option<&FileEntry>) -> bool {
     }
 }
 
-fn three_way_merge_text(base: &str, ours: &str, theirs: &str) -> String {
+/// Three-way text merge: `(merged, true)` when the edits do not overlap,
+/// `(text with conflict markers, false)` otherwise.
+fn three_way_merge_text(base: &str, ours: &str, theirs: &str) -> (String, bool) {
     match diffy_merge(base, ours, theirs) {
-        Ok(text) => text,
-        Err(conflict) => conflict,
+        Ok(text) => (text, true),
+        Err(conflict) => (conflict, false),
     }
 }
 
@@ -2109,6 +2290,7 @@ fn incoming_change(path: &str, b: Option<&FileEntry>, t: Option<&FileEntry>) -> 
         copy_from: None,
         moved_from: None,
         moved_to: None,
+        conflicted: false,
     }
 }
 

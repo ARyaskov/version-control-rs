@@ -8,12 +8,12 @@ use crate::diff::unified_diff;
 use crate::error::{Result, VcsError};
 use crate::path::safe_join;
 use crate::ra::{FileRaSession, RaSession, RemoteConfig};
-use crate::repo::{GcStats, MergeOutcome, Repository};
+use crate::repo::{GcStats, MergeOutcome, Repository, ResolveAccept};
 use crate::types::{
     BlameLine, ChangeKind, ChangedPath, Commit, Depth, DiffHunk, FileChange, FileEntry,
     RevisionRange,
 };
-use crate::wcdb::ExternalDef;
+use crate::wcdb::{ConflictRecord, ExternalDef};
 
 const STAGE_FILE: &str = ".vcrs/client-stage-index.json";
 
@@ -89,6 +89,17 @@ impl Client {
     pub fn remove(&self, paths: &[String], keep_local: bool) -> Result<Vec<String>> {
         let paths = normalize_all(paths);
         self.repo.remove(&paths, keep_local)
+    }
+
+    /// Unresolved conflicts by path.
+    pub fn conflicts(&self) -> Result<BTreeMap<String, ConflictRecord>> {
+        self.repo.conflicts()
+    }
+
+    /// Resolve conflicts on `paths` (all when empty), keeping `accept`.
+    pub fn resolve(&self, paths: &[String], accept: ResolveAccept) -> Result<Vec<String>> {
+        let paths = normalize_all(paths);
+        self.repo.resolve(&paths, accept)
     }
 
     /// Files on disk that are neither versioned nor ignored.

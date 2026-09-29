@@ -493,3 +493,93 @@ fn narrowing_depth_keeps_local_work() {
     let c2 = client.commit("r2", "a").unwrap();
     assert!(c2.files.iter().any(|f| f.path == "sub/clean.txt"));
 }
+
+fn conflicting_update(root: &Path) -> Client {
+    let client = Client::init(root).unwrap();
+    write(root, "f.txt", "a\nb\nc\n");
+    add(&client, &["f.txt"]);
+    client.commit("r1", "a").unwrap();
+    write(root, "f.txt", "a\nB\nc\n");
+    client.commit("r2", "a").unwrap();
+    client.update_to_revision("1").unwrap();
+    write(root, "f.txt", "a\nX\nc\n");
+    client.update_to_revision("HEAD").unwrap();
+    client
+}
+
+#[test]
+fn conflicts_persist_and_block_commit_until_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = conflicting_update(root);
+
+    // BASE moved to r2 despite the conflict, and the record survives status.
+    let repo = Repository::discover(root).unwrap();
+    assert_eq!(repo.resolve_revision_spec("BASE").unwrap(), 2);
+    for _ in 0..2 {
+        let st = client.status().unwrap();
+        assert!(st.iter().any(|c| c.path == "f.txt" && c.conflicted));
+    }
+    assert!(client.conflicts().unwrap().contains_key("f.txt"));
+    // Artifacts are unversioned, never committed.
+    assert!(
+        client
+            .unversioned()
+            .unwrap()
+            .contains(&"f.txt.mine".to_owned())
+    );
+    assert!(client.commit("attempt", "a").is_err());
+    assert!(
+        client.update_to_revision("HEAD").is_err(),
+        "update waits for resolve"
+    );
+
+    write(root, "f.txt", "a\nB+X\nc\n");
+    client
+        .resolve(
+            &["f.txt".to_owned()],
+            version_control_rs::ResolveAccept::Working,
+        )
+        .unwrap();
+    assert!(!root.join("f.txt.mine").exists());
+    assert!(client.conflicts().unwrap().is_empty());
+    let c3 = client.commit("resolved", "a").unwrap();
+    assert_eq!(c3.revision, 3);
+    assert_eq!(
+        client.cat_revision_file("3", "f.txt").unwrap(),
+        b"a\nB+X\nc\n"
+    );
+}
+
+#[test]
+fn resolve_can_take_the_incoming_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = conflicting_update(root);
+    client
+        .resolve(&[], version_control_rs::ResolveAccept::TheirsFull)
+        .unwrap();
+    assert_eq!(read(root, "f.txt"), "a\nB\nc\n");
+    assert!(client.status().unwrap().is_empty());
+}
+
+#[test]
+fn non_overlapping_edits_merge_cleanly_on_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n");
+    add(&client, &["f.txt"]);
+    client.commit("r1", "a").unwrap();
+    write(root, "f.txt", "ONE\n2\n3\n4\n5\n6\n7\n8\n");
+    client.commit("r2", "a").unwrap();
+    client.update_to_revision("1").unwrap();
+
+    write(root, "f.txt", "1\n2\n3\n4\n5\n6\n7\nEIGHT\n");
+    client.update_to_revision("HEAD").unwrap();
+    assert!(client.conflicts().unwrap().is_empty());
+    assert_eq!(read(root, "f.txt"), "ONE\n2\n3\n4\n5\n6\n7\nEIGHT\n");
+    let st = client.status().unwrap();
+    assert_eq!(st.len(), 1);
+    assert!(!st[0].conflicted);
+}

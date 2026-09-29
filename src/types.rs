@@ -69,6 +69,9 @@ pub struct FileChange {
     pub moved_from: Option<String>,
     #[serde(default)]
     pub moved_to: Option<String>,
+    /// An unresolved conflict is recorded for this path.
+    #[serde(default)]
+    pub conflicted: bool,
 }
 
 #[derive(Debug, Clone)]
