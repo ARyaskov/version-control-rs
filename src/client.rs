@@ -270,9 +270,7 @@ impl Client {
             .repo
             .commit_selective(&staged_full, &staged_partial, message, author)?;
 
-        if push
-            && let Some(cfg) = self.remote_config()?
-        {
+        if push && let Some(cfg) = self.remote_config()? {
             let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
             ra.push(&self.repo.root)?;
         }
@@ -666,7 +664,6 @@ impl Client {
             })?;
         Ok((base, working))
     }
-
 }
 
 impl StageIndex {

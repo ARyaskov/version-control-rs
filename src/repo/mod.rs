@@ -341,7 +341,15 @@ impl Repository {
         let wcdb = self.wcdb()?;
         let file_props = wcdb.file_props(rel)?;
         let inherited = wcdb.inherited_props_for_path(rel)?;
-        self.finalize_entry(rel, raw, is_symlink, executable, &file_props, &inherited, persist)
+        self.finalize_entry(
+            rel,
+            raw,
+            is_symlink,
+            executable,
+            &file_props,
+            &inherited,
+            persist,
+        )
     }
 
     fn finalize_entry(
@@ -354,7 +362,8 @@ impl Repository {
         inherited: &BTreeMap<String, String>,
         persist: bool,
     ) -> Result<FileEntry> {
-        let (bytes, props, is_binary) = repo_form(raw, is_symlink, file_props, inherited, executable);
+        let (bytes, props, is_binary) =
+            repo_form(raw, is_symlink, file_props, inherited, executable);
         let blob_id = if persist {
             self.write_blob(&bytes)?
         } else {
@@ -390,7 +399,8 @@ impl Repository {
         let wcdb = self.wcdb()?;
         let file_props = wcdb.file_props(rel)?;
         let inherited = wcdb.inherited_props_for_path(rel)?;
-        let (bytes, _props, _is_binary) = repo_form(raw, is_symlink, &file_props, &inherited, false);
+        let (bytes, _props, _is_binary) =
+            repo_form(raw, is_symlink, &file_props, &inherited, false);
         Ok(bytes)
     }
 
@@ -644,8 +654,10 @@ impl Repository {
     ) -> Result<Commit> {
         self.ensure_initialized()?;
         let head_files = self.head_commit()?.map(|c| c.files).unwrap_or_default();
-        let mut result: BTreeMap<String, FileEntry> =
-            head_files.into_iter().map(|f| (f.path.clone(), f)).collect();
+        let mut result: BTreeMap<String, FileEntry> = head_files
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect();
 
         for path in staged_full {
             let abs = rel_to_abs(&self.root, path);

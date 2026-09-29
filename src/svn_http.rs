@@ -501,10 +501,7 @@ struct PasswdFile {
 /// valid HTTP Basic credentials are required and the Basic username is used
 /// (the spoofable `SVN-UserName` header is ignored). Without a passwd file,
 /// access is anonymous.
-fn authenticate(
-    repo_root: &Path,
-    req: &HttpRequest,
-) -> std::result::Result<String, HttpResponse> {
+fn authenticate(repo_root: &Path, req: &HttpRequest) -> std::result::Result<String, HttpResponse> {
     let passwd_path = repo_root.join(".vcrs").join("passwd.json");
     if !passwd_path.exists() {
         let user = req
@@ -897,9 +894,7 @@ fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     for _ in 0..10 {
         if *pos >= bytes.len() {
-            return Err(VcsError::Protocol(
-                "truncated svndiff varint".to_owned(),
-            ));
+            return Err(VcsError::Protocol("truncated svndiff varint".to_owned()));
         }
         let b = bytes[*pos];
         *pos += 1;
@@ -909,9 +904,7 @@ fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
         }
         shift += 7;
     }
-    Err(VcsError::Protocol(
-        "invalid svndiff varint".to_owned(),
-    ))
+    Err(VcsError::Protocol("invalid svndiff varint".to_owned()))
 }
 
 fn encode_svndiff_full(new_data: &[u8]) -> Vec<u8> {
@@ -943,9 +936,7 @@ fn encode_svndiff_full(new_data: &[u8]) -> Vec<u8> {
 /// is validated against the remaining budget *before* any allocation.
 fn apply_svndiff_stream(base: &[u8], data: &[u8], max_total: usize) -> Result<Vec<u8>> {
     if data.len() < 4 || &data[..3] != b"SVN" {
-        return Err(VcsError::Protocol(
-            "invalid svndiff header".to_owned(),
-        ));
+        return Err(VcsError::Protocol("invalid svndiff header".to_owned()));
     }
     let version = data[3];
     if version != 0 && version != 1 {
@@ -967,9 +958,7 @@ fn apply_svndiff_stream(base: &[u8], data: &[u8], max_total: usize) -> Result<Ve
             ));
         }
         if pos + ins_len + new_len > data.len() {
-            return Err(VcsError::Protocol(
-                "truncated svndiff window".to_owned(),
-            ));
+            return Err(VcsError::Protocol("truncated svndiff window".to_owned()));
         }
         let instructions_raw = &data[pos..pos + ins_len];
         pos += ins_len;
@@ -990,9 +979,7 @@ fn apply_svndiff_stream(base: &[u8], data: &[u8], max_total: usize) -> Result<Ve
 
         let source_end = src_off.saturating_add(src_len);
         if source_end > base.len() {
-            return Err(VcsError::Protocol(
-                "source view out of bounds".to_owned(),
-            ));
+            return Err(VcsError::Protocol("source view out of bounds".to_owned()));
         }
         let source = &base[src_off..source_end];
         let target = apply_svndiff_window(source, &instructions, &new_data, tgt_len)?;
@@ -1056,18 +1043,14 @@ fn apply_svndiff_window(
                 let off = decode_varint(instructions, &mut ip)? as usize;
                 let end = off.saturating_add(len);
                 if end > source.len() {
-                    return Err(VcsError::Protocol(
-                        "copy-source out of bounds".to_owned(),
-                    ));
+                    return Err(VcsError::Protocol("copy-source out of bounds".to_owned()));
                 }
                 out.extend_from_slice(&source[off..end]);
             }
             1 => {
                 let off = decode_varint(instructions, &mut ip)? as usize;
                 if off >= out.len() {
-                    return Err(VcsError::Protocol(
-                        "copy-target out of bounds".to_owned(),
-                    ));
+                    return Err(VcsError::Protocol("copy-target out of bounds".to_owned()));
                 }
                 // Support overlap like memmove semantics.
                 for i in 0..len {
@@ -1083,9 +1066,7 @@ fn apply_svndiff_window(
             2 => {
                 let end = np.saturating_add(len);
                 if end > new_data.len() {
-                    return Err(VcsError::Protocol(
-                        "copy-new out of bounds".to_owned(),
-                    ));
+                    return Err(VcsError::Protocol("copy-new out of bounds".to_owned()));
                 }
                 out.extend_from_slice(&new_data[np..end]);
                 np = end;
@@ -1436,7 +1417,10 @@ mod tests {
     fn sanitize_blocks_encoded_traversal() {
         // "%2e%2e" must not smuggle ".." past the guard.
         assert!(sanitize_repo_rel("foo/%2e%2e/etc").is_err());
-        assert_eq!(sanitize_repo_rel("dir/my%20file.txt").unwrap(), "dir/my file.txt");
+        assert_eq!(
+            sanitize_repo_rel("dir/my%20file.txt").unwrap(),
+            "dir/my file.txt"
+        );
     }
 
     #[test]

@@ -507,7 +507,9 @@ impl WcDb {
     /// Load every per-file property in one query, grouped by path. Used by the
     /// working-copy snapshot to avoid one SQL round-trip per file.
     pub fn all_file_props(&self) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-        let mut stmt = self.conn.prepare("SELECT path, name, value FROM file_props")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, name, value FROM file_props")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,

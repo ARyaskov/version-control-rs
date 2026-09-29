@@ -157,7 +157,10 @@ fn unified_diff_has_hunk_headers() {
     write(root, "f.txt", "1\n2\n3\nFOUR\n5\n6\n7\n8\n");
 
     let patch = client.diff(None, None).unwrap();
-    assert!(patch.contains("@@"), "expected unified hunk header in: {patch}");
+    assert!(
+        patch.contains("@@"),
+        "expected unified hunk header in: {patch}"
+    );
     assert!(patch.contains("-4"));
     assert!(patch.contains("+FOUR"));
 }
@@ -172,13 +175,17 @@ fn gc_removes_unreferenced_blobs() {
 
     // Inject an orphan blob.
     let repo = Repository::discover(root).unwrap();
-    repo.write_blob(b"totally unreferenced orphan blob").unwrap();
+    repo.write_blob(b"totally unreferenced orphan blob")
+        .unwrap();
 
     let stats = client.gc().unwrap();
     assert!(stats.removed >= 1, "expected at least one orphan removed");
     assert!(stats.kept >= 1, "referenced blob must be kept");
     // The referenced file is still readable after gc.
-    assert_eq!(client.cat_revision_file("1", "keep.txt").unwrap(), b"referenced content\n");
+    assert_eq!(
+        client.cat_revision_file("1", "keep.txt").unwrap(),
+        b"referenced content\n"
+    );
 }
 
 #[test]
