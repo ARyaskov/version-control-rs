@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,20 +11,39 @@ use super::{Repository, VCRS_DIR};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Write `content` to `path` atomically: write a uniquely-named temp file in the
-/// same directory, then rename it over the destination (an atomic replace on the
-/// same filesystem). Prevents a torn write from corrupting HEAD/commit/blob.
+/// Write `content` to `path` atomically and durably: write a uniquely-named
+/// temp file in the same directory, fsync it, rename it over the destination
+/// (an atomic replace on the same filesystem) and fsync the directory so the
+/// rename itself survives a crash. Prevents torn or lost HEAD/commit/blob data.
 fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| VcsError::PathOutsideRepository(path.display().to_string()))?;
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".vcrs-tmp-{}-{}.tmp", std::process::id(), n));
-    fs::write(&tmp, content)?;
-    if let Err(e) = fs::rename(&tmp, path) {
+    let result = (|| -> std::io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        sync_dir(parent)
+    })();
+    if let Err(e) = result {
         let _ = fs::remove_file(&tmp);
         return Err(VcsError::Io(e));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    // Windows offers no portable directory fsync; NTFS journals the rename.
     Ok(())
 }
 
@@ -39,33 +59,9 @@ fn commits_dir(repo: &Repository) -> PathBuf {
     vcrs(repo).join("commits")
 }
 
-fn head_file(repo: &Repository) -> PathBuf {
-    vcrs(repo).join("HEAD")
-}
-
 pub fn ensure_layout(repo: &Repository) -> Result<()> {
     fs::create_dir_all(objects_dir(repo))?;
     fs::create_dir_all(commits_dir(repo))?;
-    if !head_file(repo).exists() {
-        fs::write(head_file(repo), b"")?;
-    }
-    Ok(())
-}
-
-pub fn read_head(repo: &Repository) -> Result<Option<String>> {
-    ensure_layout(repo)?;
-    let head = fs::read_to_string(head_file(repo))?;
-    let trimmed = head.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_owned()))
-    }
-}
-
-pub fn write_head(repo: &Repository, commit_id: &str) -> Result<()> {
-    ensure_layout(repo)?;
-    atomic_write(&head_file(repo), commit_id.as_bytes())?;
     Ok(())
 }
 
@@ -101,6 +97,16 @@ pub fn write_commit(repo: &Repository, commit: &Commit) -> Result<()> {
     let path = commit_path(repo, &commit.id);
     let json = serde_json::to_vec_pretty(commit)?;
     atomic_write(&path, &json)?;
+    Ok(())
+}
+
+/// Remove a commit object that was never published (e.g. rejected by the
+/// pre-commit hook).
+pub fn delete_commit(repo: &Repository, id: &str) -> Result<()> {
+    let path = commit_path(repo, id);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
     Ok(())
 }
 

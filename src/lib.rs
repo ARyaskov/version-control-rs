@@ -16,6 +16,6 @@ pub use ra::{Capability, FileRaSession, RaSession, RemoteConfig, WireRequest, Wi
 pub use repo::{GcStats, MergeOutcome};
 pub use types::{
     BlameLine, ChangeKind, ChangedPath, ChangedPathAction, Commit, Depth, DiffHunk, FileChange,
-    FileEntry, RevisionRange, TxnRecord,
+    FileEntry, RevisionRange,
 };
 pub use wcdb::ExternalDef;

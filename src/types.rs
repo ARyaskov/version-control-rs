@@ -107,62 +107,6 @@ impl Depth {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TxnRecord {
-    pub id: String,
-    pub next_rev: i64,
-    pub base_rev: i64,
-    pub head_rev: i64,
-    pub parent_id: Option<String>,
-    pub author: String,
-    pub message: String,
-    pub phase: String,
-    pub started_at: DateTime<Utc>,
-    pub changed_files: Vec<FileChange>,
-    #[serde(default)]
-    pub pending_merges: Vec<(String, i64)>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TxnOp {
-    WriteHead {
-        old: Option<String>,
-        new: String,
-    },
-    WriteCommit {
-        id: String,
-    },
-    DeleteCommit {
-        id: String,
-    },
-    UpsertRevision {
-        rev: i64,
-    },
-    DeleteRevision {
-        rev: i64,
-    },
-    SetBaseRevision {
-        old: i64,
-        new: i64,
-    },
-    AddMergeEdge {
-        target_rev: i64,
-        merged_rev: i64,
-        source_path: String,
-    },
-    DeleteMergeEdge {
-        target_rev: i64,
-        merged_rev: i64,
-        source_path: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TxnJournalEntry {
-    pub redo: TxnOp,
-    pub undo: TxnOp,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangedPathAction {
     Add,

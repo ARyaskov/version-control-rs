@@ -5,7 +5,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Result;
-use crate::types::{FileChange, FileEntry};
+use crate::types::{Commit, FileChange, FileEntry};
 
 /// Bump when the schema below changes so existing working copies re-run the
 /// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
@@ -14,6 +14,34 @@ const SCHEMA_VERSION: i64 = 1;
 #[derive(Debug)]
 pub struct WcDb {
     conn: Connection,
+}
+
+/// One row of the revision index.
+#[derive(Debug, Clone)]
+pub struct RevisionRow {
+    pub rev: i64,
+    pub commit_id: String,
+    pub parent_rev: Option<i64>,
+    pub author: String,
+    pub message: String,
+    pub created_at: String,
+    pub changed_paths_json: String,
+    pub mergeinfo_json: String,
+}
+
+impl RevisionRow {
+    pub fn from_commit(c: &Commit) -> Result<Self> {
+        Ok(Self {
+            rev: c.revision,
+            commit_id: c.id.clone(),
+            parent_rev: c.parent_revision,
+            author: c.author.clone(),
+            message: c.message.clone(),
+            created_at: c.created_at.to_rfc3339(),
+            changed_paths_json: serde_json::to_string(&c.changed_paths)?,
+            mergeinfo_json: serde_json::to_string(&c.mergeinfo)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +60,7 @@ impl WcDb {
         // HTTP server handles overlapping requests against the same wc.db.
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;\n             PRAGMA synchronous = NORMAL;\n             PRAGMA foreign_keys = ON;",
+            "PRAGMA journal_mode = WAL;\n             PRAGMA synchronous = FULL;\n             PRAGMA foreign_keys = ON;",
         )?;
         let db = Self { conn };
         db.init_schema()?;
@@ -656,114 +684,60 @@ impl WcDb {
         Ok(out)
     }
 
-    pub fn add_revision(
+    /// The commit point: publish revision `row`, record its merge edges,
+    /// consume the pending merges and move BASE — all in one transaction, so a
+    /// crash leaves either the previous state or the complete new revision.
+    pub fn record_commit(
         &self,
-        rev: i64,
-        commit_id: &str,
-        parent_rev: Option<i64>,
-        author: &str,
-        message: &str,
-        created_at: &str,
-        changed_paths_json: &str,
-        mergeinfo_json: &str,
+        row: &RevisionRow,
+        merged: &[(String, i64)],
+        new_base: i64,
     ) -> Result<()> {
         self.with_write_tx(|tx| {
-            tx.execute(
-                "INSERT INTO revisions(rev, commit_id, parent_rev, author, message, created_at, changed_paths_json, mergeinfo_json)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    rev,
-                    commit_id,
-                    parent_rev,
-                    author,
-                    message,
-                    created_at,
-                    changed_paths_json,
-                    mergeinfo_json
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO meta(k, v) VALUES(?1, ?2)
-                 ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                params!["head_revision", rev.to_string()],
-            )?;
+            insert_revision(tx, row)?;
+            for (source_path, merged_rev) in merged {
+                tx.execute(
+                    "INSERT OR IGNORE INTO merge_edges(target_rev, merged_rev, source_path) VALUES(?1,?2,?3)",
+                    params![row.rev, merged_rev, source_path],
+                )?;
+            }
+            tx.execute("DELETE FROM pending_merges", [])?;
+            set_meta_tx(tx, "head_revision", &row.rev.to_string())?;
+            set_meta_tx(tx, "base_revision", &new_base.to_string())?;
             Ok(())
         })
     }
 
-    pub fn upsert_revision(
+    /// Replace the whole revision index (e.g. after pull/push moved HEAD).
+    pub fn replace_revisions(
         &self,
-        rev: i64,
-        commit_id: &str,
-        parent_rev: Option<i64>,
-        author: &str,
-        message: &str,
-        created_at: &str,
-        changed_paths_json: &str,
-        mergeinfo_json: &str,
+        rows: &[RevisionRow],
+        edges: &[(i64, i64, String)],
     ) -> Result<()> {
         self.with_write_tx(|tx| {
-            tx.execute(
-                "INSERT INTO revisions(rev, commit_id, parent_rev, author, message, created_at, changed_paths_json, mergeinfo_json)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-                 ON CONFLICT(rev) DO UPDATE SET
-                   commit_id=excluded.commit_id,
-                   parent_rev=excluded.parent_rev,
-                   author=excluded.author,
-                   message=excluded.message,
-                   created_at=excluded.created_at,
-                   changed_paths_json=excluded.changed_paths_json,
-                   mergeinfo_json=excluded.mergeinfo_json",
-                params![
-                    rev,
-                    commit_id,
-                    parent_rev,
-                    author,
-                    message,
-                    created_at,
-                    changed_paths_json,
-                    mergeinfo_json
-                ],
-            )?;
+            tx.execute("DELETE FROM revisions", [])?;
+            tx.execute("DELETE FROM merge_edges", [])?;
+            for row in rows {
+                insert_revision(tx, row)?;
+            }
+            for (target_rev, merged_rev, source_path) in edges {
+                tx.execute(
+                    "INSERT OR IGNORE INTO merge_edges(target_rev, merged_rev, source_path) VALUES(?1,?2,?3)",
+                    params![target_rev, merged_rev, source_path],
+                )?;
+            }
+            let head = rows.last().map_or(0, |r| r.rev);
+            set_meta_tx(tx, "head_revision", &head.to_string())?;
             Ok(())
         })
     }
 
-    pub fn delete_revision(&self, rev: i64) -> Result<()> {
-        self.with_write_tx(|tx| {
-            tx.execute("DELETE FROM revisions WHERE rev=?1", params![rev])?;
-            Ok(())
-        })
-    }
-
-    pub fn add_merge_edge(
-        &self,
-        target_rev: i64,
-        merged_rev: i64,
-        source_path: &str,
-    ) -> Result<()> {
-        self.with_write_tx(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO merge_edges(target_rev, merged_rev, source_path) VALUES(?1,?2,?3)",
-                params![target_rev, merged_rev, source_path],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn delete_merge_edge(
-        &self,
-        target_rev: i64,
-        merged_rev: i64,
-        source_path: &str,
-    ) -> Result<()> {
-        self.with_write_tx(|tx| {
-            tx.execute(
-                "DELETE FROM merge_edges WHERE target_rev=?1 AND merged_rev=?2 AND source_path=?3",
-                params![target_rev, merged_rev, source_path],
-            )?;
-            Ok(())
-        })
+    /// Commit id of the newest indexed revision (HEAD), if any.
+    pub fn head_commit_id(&self) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT commit_id FROM revisions ORDER BY rev DESC LIMIT 1")?;
+        Ok(stmt.query_row([], |r| r.get(0)).optional()?)
     }
 
     pub fn merged_revisions_set(&self) -> Result<std::collections::BTreeSet<i64>> {
@@ -821,25 +795,6 @@ impl WcDb {
         Ok(out)
     }
 
-    pub fn take_pending_merges(&self) -> Result<Vec<(String, i64)>> {
-        self.with_write_tx(|tx| {
-            let out = {
-                let mut stmt = tx.prepare(
-                    "SELECT source_path, merged_rev FROM pending_merges ORDER BY source_path, merged_rev",
-                )?;
-                let rows =
-                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-                let mut out = Vec::new();
-                for row in rows {
-                    out.push(row?);
-                }
-                out
-            };
-            tx.execute("DELETE FROM pending_merges", [])?;
-            Ok(out)
-        })
-    }
-
     pub fn revision_for_commit(&self, commit_id: &str) -> Result<Option<i64>> {
         let mut stmt = self
             .conn
@@ -892,6 +847,32 @@ impl WcDb {
             Ok(())
         })
     }
+}
+
+fn insert_revision(tx: &rusqlite::Transaction<'_>, row: &RevisionRow) -> Result<()> {
+    tx.execute(
+        "INSERT INTO revisions(rev, commit_id, parent_rev, author, message, created_at, changed_paths_json, mergeinfo_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            row.rev,
+            row.commit_id,
+            row.parent_rev,
+            row.author,
+            row.message,
+            row.created_at,
+            row.changed_paths_json,
+            row.mergeinfo_json
+        ],
+    )?;
+    Ok(())
+}
+
+fn set_meta_tx(tx: &rusqlite::Transaction<'_>, key: &str, value: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO meta(k, v) VALUES(?1, ?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 /// All scope prefixes that apply to `path`, from the repository root ("") down

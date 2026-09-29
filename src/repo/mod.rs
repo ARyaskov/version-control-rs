@@ -18,9 +18,9 @@ use crate::error::{Result, VcsError};
 use crate::path::{is_reserved_component, rel_from_fs, safe_join};
 use crate::types::{
     BlameLine, ChangeKind, ChangedPath, ChangedPathAction, Commit, Depth, FileChange, FileEntry,
-    RevisionRange, TxnJournalEntry, TxnOp, TxnRecord,
+    RevisionRange,
 };
-use crate::wcdb::{ExternalDef, WcDb};
+use crate::wcdb::{ExternalDef, RevisionRow, WcDb};
 
 pub(crate) const VCRS_DIR: &str = ".vcrs";
 
@@ -90,8 +90,7 @@ impl Repository {
         let _lock = self.lock()?;
         storage::ensure_layout(self)?;
         let wcdb = self.wcdb()?;
-        let _ = wcdb.max_revision()?;
-        self.replay_or_abort_transactions()?;
+        self.migrate_legacy_layout()?;
         self.process_work_queue()?;
         if self.head_commit_id()?.is_none() {
             wcdb.set_head_revision(0)?;
@@ -118,13 +117,17 @@ impl Repository {
         safe_join(&self.root, rel)
     }
 
+    /// The newest indexed revision's commit. The revision index in wc.db is
+    /// the single source of truth for HEAD (updated in the commit transaction).
     pub fn head_commit_id(&self) -> Result<Option<String>> {
-        storage::read_head(self)
+        self.wcdb()?.head_commit_id()
     }
 
+    /// Point HEAD at `commit_id` (whose objects must already be present),
+    /// re-indexing the revisions along its parent chain.
     pub fn set_head_commit_id(&self, commit_id: &str) -> Result<()> {
         let _lock = self.lock()?;
-        storage::write_head(self, commit_id)
+        self.index_chain(Some(commit_id))
     }
 
     pub fn head_commit(&self) -> Result<Option<Commit>> {
@@ -151,44 +154,11 @@ impl Repository {
         Ok(commit.files.into_iter().find(|f| f.path == path))
     }
 
+    /// Re-derive the revision index from the current HEAD's parent chain.
     pub fn rebuild_revision_index(&self) -> Result<()> {
         let _lock = self.lock()?;
-        let commits_dir = self.root.join(VCRS_DIR).join("commits");
-        if !commits_dir.exists() {
-            return Ok(());
-        }
-        let wcdb = self.wcdb()?;
-        let mut commits = Vec::new();
-        for entry in fs::read_dir(commits_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(path)?;
-            let commit = storage::parse_commit(&bytes)?;
-            commits.push(commit);
-        }
-        commits.sort_by_key(|c| c.revision);
-        let mut max_rev = 0_i64;
-        for c in commits {
-            max_rev = max_rev.max(c.revision);
-            wcdb.upsert_revision(
-                c.revision,
-                &c.id,
-                c.parent_revision,
-                &c.author,
-                &c.message,
-                &c.created_at.to_rfc3339(),
-                &serde_json::to_string(&c.changed_paths)?,
-                &serde_json::to_string(&c.mergeinfo)?,
-            )?;
-        }
-        wcdb.set_head_revision(max_rev)?;
-        Ok(())
+        let head = self.head_commit_id()?;
+        self.index_chain(head.as_deref())
     }
 
     pub fn write_blob(&self, content: &[u8]) -> Result<String> {
@@ -196,8 +166,8 @@ impl Repository {
         storage::write_blob(self, content)
     }
 
-    /// Sweep blobs in the object store that no commit references. Not safe to
-    /// run concurrently with a commit in progress.
+    /// Sweep blobs in the object store that no commit references. Runs under
+    /// the repository lock, so no commit can be in progress.
     pub fn gc(&self) -> Result<GcStats> {
         let _lock = self.lock()?;
         let commits_dir = self.root.join(VCRS_DIR).join("commits");
@@ -478,11 +448,9 @@ impl Repository {
         let parent = self.head_commit()?;
         let changed = compute_changed_files(parent.as_ref().map(|c| c.files.as_slice()), &snapshot);
         let parent_revision = parent.as_ref().map(|c| c.revision);
-        let pending_merges = if has_pending_merges {
-            wcdb.take_pending_merges()?
-        } else {
-            Vec::new()
-        };
+        // Consumed atomically with the revision itself (see record_commit), so
+        // a failed or interrupted commit never loses recorded merges.
+        let pending_merges = wcdb.pending_merges()?;
 
         if changed.is_empty() && pending_merges.is_empty() {
             return Ok(parent.unwrap_or(Commit {
@@ -558,26 +526,6 @@ impl Repository {
             .entry("svn:date".to_owned())
             .or_insert_with(|| Utc::now().to_rfc3339());
 
-        let txn = TxnRecord {
-            id: id.clone(),
-            next_rev,
-            base_rev,
-            head_rev,
-            parent_id: parent_id.clone(),
-            author: author.to_owned(),
-            message: message.to_owned(),
-            phase: "begun".to_owned(),
-            started_at: Utc::now(),
-            changed_files: changed.clone(),
-            pending_merges: pending_merges.clone(),
-        };
-        self.begin_txn(&txn)?;
-        if let Err(err) = self.run_hook("pre-commit", &[txn.id.as_str()]) {
-            self.abort_txn(&txn)?;
-            return Err(err);
-        }
-        self.update_txn_phase(&txn.id, "pre-commit-ok")?;
-
         let commit = Commit {
             id: id.clone(),
             revision: next_rev,
@@ -587,90 +535,34 @@ impl Repository {
             message: message.to_owned(),
             created_at: Utc::now(),
             files: snapshot,
-            changed_files: changed.clone(),
-            mergeinfo: mergeinfo.clone(),
-            revprops: revprops.clone(),
-            txn_id: Some(txn.id.clone()),
-            changed_paths: changed_paths.clone(),
+            changed_files: changed,
+            mergeinfo,
+            revprops,
+            txn_id: None,
+            changed_paths,
         };
 
-        let result: Result<()> = (|| {
-            let old_head = self.head_commit_id()?;
-            storage::write_commit(self, &commit)?;
-            self.append_txn_journal(
-                &txn.id,
-                TxnOp::WriteCommit { id: id.clone() },
-                TxnOp::DeleteCommit { id: id.clone() },
-            )?;
-            self.update_txn_phase(&txn.id, "commit-written")?;
-            storage::write_head(self, &id)?;
-            self.append_txn_journal(
-                &txn.id,
-                TxnOp::WriteHead {
-                    old: old_head.clone(),
-                    new: id.clone(),
-                },
-                TxnOp::WriteHead {
-                    old: Some(id.clone()),
-                    new: old_head.unwrap_or_default(),
-                },
-            )?;
-            self.update_txn_phase(&txn.id, "head-written")?;
-
-            wcdb.add_revision(
-                next_rev,
-                &id,
-                parent_revision,
-                author,
-                message,
-                &commit.created_at.to_rfc3339(),
-                &serde_json::to_string(&changed_paths)?,
-                &serde_json::to_string(&mergeinfo)?,
-            )?;
-            self.append_txn_journal(
-                &txn.id,
-                TxnOp::UpsertRevision { rev: next_rev },
-                TxnOp::DeleteRevision { rev: next_rev },
-            )?;
-            for (source_path, merged_rev) in pending_merges {
-                wcdb.add_merge_edge(next_rev, merged_rev, &source_path)?;
-                self.append_txn_journal(
-                    &txn.id,
-                    TxnOp::AddMergeEdge {
-                        target_rev: next_rev,
-                        merged_rev,
-                        source_path: source_path.clone(),
-                    },
-                    TxnOp::DeleteMergeEdge {
-                        target_rev: next_rev,
-                        merged_rev,
-                        source_path,
-                    },
-                )?;
-            }
-            wcdb.set_base_revision(next_rev)?;
-            self.append_txn_journal(
-                &txn.id,
-                TxnOp::SetBaseRevision {
-                    old: base_rev,
-                    new: next_rev,
-                },
-                TxnOp::SetBaseRevision {
-                    old: next_rev,
-                    new: base_rev,
-                },
-            )?;
-            self.sync_wcdb()?;
-            self.update_txn_phase(&txn.id, "wcdb-written")?;
-            Ok(())
-        })();
-
-        if let Err(err) = result {
-            self.abort_txn(&txn)?;
+        // Commit protocol (the repository lock is held throughout):
+        //   1. blobs are already durable (fsync'd by the object store);
+        //   2. the commit object is written durably but is not referenced yet;
+        //   3. the pre-commit hook may inspect `.vcrs/commits/<id>.json`;
+        //   4. one SQLite transaction publishes the revision, moves BASE and
+        //      consumes pending merges — this is the single commit point.
+        // A crash before (4) leaves only an unreferenced object for gc.
+        storage::write_commit(self, &commit)?;
+        if let Err(err) = self.run_hook("pre-commit", &[id.as_str()]) {
+            let _ = storage::delete_commit(self, &id);
             return Err(err);
         }
+        wcdb.record_commit(
+            &RevisionRow::from_commit(&commit)?,
+            &pending_merges,
+            next_rev,
+        )?;
 
-        self.complete_txn(&txn.id)?;
+        // Working-copy node metadata is derived data: the commit is already
+        // durable, and the next status/sync repairs it if this refresh fails.
+        let _ = self.sync_wcdb();
         self.run_hook("post-commit", &[&next_rev.to_string(), &id])?;
         Ok(commit)
     }
@@ -1233,133 +1125,6 @@ impl Repository {
         WcDb::open(&self.root)
     }
 
-    fn begin_txn(&self, txn: &TxnRecord) -> Result<()> {
-        let dir = self.root.join(VCRS_DIR).join("transactions");
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.json", txn.id));
-        fs::write(path, serde_json::to_vec_pretty(txn)?)?;
-        fs::write(
-            dir.join(format!("{}.journal.json", txn.id)),
-            serde_json::to_vec_pretty(&Vec::<TxnJournalEntry>::new())?,
-        )?;
-        Ok(())
-    }
-
-    fn update_txn_phase(&self, txn_id: &str, phase: &str) -> Result<()> {
-        let path = self
-            .root
-            .join(VCRS_DIR)
-            .join("transactions")
-            .join(format!("{txn_id}.json"));
-        if !path.exists() {
-            return Ok(());
-        }
-        let bytes = fs::read(&path)?;
-        let mut txn: TxnRecord = serde_json::from_slice(&bytes)?;
-        txn.phase = phase.to_owned();
-        fs::write(path, serde_json::to_vec_pretty(&txn)?)?;
-        Ok(())
-    }
-
-    fn abort_txn(&self, txn: &TxnRecord) -> Result<()> {
-        let entries = self.read_txn_journal(&txn.id)?;
-        for entry in entries.into_iter().rev() {
-            let _ = self.apply_txn_op(&entry.undo);
-        }
-        for (path, rev) in &txn.pending_merges {
-            let _ = self.wcdb()?.add_pending_merge(path, *rev);
-        }
-        self.complete_txn(&txn.id)
-    }
-
-    fn complete_txn(&self, txn_id: &str) -> Result<()> {
-        let tx_path = self
-            .root
-            .join(VCRS_DIR)
-            .join("transactions")
-            .join(format!("{txn_id}.json"));
-        if tx_path.exists() {
-            fs::remove_file(tx_path)?;
-        }
-        let journal_path = self
-            .root
-            .join(VCRS_DIR)
-            .join("transactions")
-            .join(format!("{txn_id}.journal.json"));
-        if journal_path.exists() {
-            fs::remove_file(journal_path)?;
-        }
-        Ok(())
-    }
-
-    fn append_txn_journal(&self, txn_id: &str, redo: TxnOp, undo: TxnOp) -> Result<()> {
-        let mut entries = self.read_txn_journal(txn_id)?;
-        entries.push(TxnJournalEntry { redo, undo });
-        let path = self
-            .root
-            .join(VCRS_DIR)
-            .join("transactions")
-            .join(format!("{txn_id}.journal.json"));
-        fs::write(path, serde_json::to_vec_pretty(&entries)?)?;
-        Ok(())
-    }
-
-    fn read_txn_journal(&self, txn_id: &str) -> Result<Vec<TxnJournalEntry>> {
-        let path = self
-            .root
-            .join(VCRS_DIR)
-            .join("transactions")
-            .join(format!("{txn_id}.journal.json"));
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let bytes = fs::read(path)?;
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    fn apply_txn_op(&self, op: &TxnOp) -> Result<()> {
-        match op {
-            TxnOp::WriteHead { new, .. } => {
-                storage::write_head(self, new)?;
-            }
-            TxnOp::WriteCommit { .. } => {}
-            TxnOp::DeleteCommit { id } => {
-                let p = self
-                    .root
-                    .join(VCRS_DIR)
-                    .join("commits")
-                    .join(format!("{id}.json"));
-                if p.exists() {
-                    fs::remove_file(p)?;
-                }
-            }
-            TxnOp::UpsertRevision { .. } => {}
-            TxnOp::DeleteRevision { rev } => {
-                self.wcdb()?.delete_revision(*rev)?;
-            }
-            TxnOp::SetBaseRevision { new, .. } => {
-                self.wcdb()?.set_base_revision(*new)?;
-            }
-            TxnOp::AddMergeEdge {
-                target_rev,
-                merged_rev,
-                source_path,
-            } => {
-                self.wcdb()?
-                    .add_merge_edge(*target_rev, *merged_rev, source_path)?;
-            }
-            TxnOp::DeleteMergeEdge {
-                target_rev,
-                merged_rev,
-                source_path,
-            } => {
-                self.wcdb()?
-                    .delete_merge_edge(*target_rev, *merged_rev, source_path)?;
-            }
-        }
-        Ok(())
-    }
-
     fn run_hook(&self, hook_name: &str, args: &[&str]) -> Result<()> {
         if !self.hooks_enabled {
             return Ok(());
@@ -1401,43 +1166,74 @@ impl Repository {
         })
     }
 
-    fn replay_or_abort_transactions(&self) -> Result<()> {
-        let tx_dir = self.root.join(VCRS_DIR).join("transactions");
-        if !tx_dir.exists() {
-            return Ok(());
+    /// Upgrade metadata written by versions before 0.3: HEAD lived in a file
+    /// updated separately from the revision index, with a JSON undo/redo
+    /// journal around it. The revision index is rebuilt from that HEAD's
+    /// parent chain (the authoritative history) and both files are retired;
+    /// leftover commit objects of interrupted transactions are unreferenced and
+    /// collected by gc.
+    fn migrate_legacy_layout(&self) -> Result<()> {
+        let vcrs = self.root.join(VCRS_DIR);
+        let head_file = vcrs.join("HEAD");
+        if head_file.exists() {
+            let head = fs::read_to_string(&head_file)?;
+            let head = head.trim();
+            if !head.is_empty() {
+                self.index_chain(Some(head))?;
+            }
+            fs::remove_file(&head_file)?;
         }
-        for entry in fs::read_dir(tx_dir)? {
-            let entry = entry?;
-            let p = entry.path();
-            if !p.is_file() {
-                continue;
-            }
-            let bytes = fs::read(&p)?;
-            let txn: TxnRecord = match serde_json::from_slice(&bytes) {
-                Ok(t) => t,
-                Err(_) => {
-                    let _ = fs::remove_file(&p);
-                    continue;
-                }
-            };
-            let commit_path = self
-                .root
-                .join(VCRS_DIR)
-                .join("commits")
-                .join(format!("{}.json", txn.id));
-            if commit_path.exists() {
-                let entries = self.read_txn_journal(&txn.id).unwrap_or_default();
-                for entry in entries {
-                    let _ = self.apply_txn_op(&entry.redo);
-                }
-                let _ = self.rebuild_revision_index();
-                let _ = self.sync_wcdb();
-                let _ = self.complete_txn(&txn.id);
-            } else {
-                let _ = self.abort_txn(&txn);
-            }
+        let transactions = vcrs.join("transactions");
+        if transactions.exists() {
+            fs::remove_dir_all(transactions)?;
         }
         Ok(())
+    }
+
+    /// Rebuild the revision index (revisions + merge edges) from the parent
+    /// chain ending at `head`. Only commits on that chain are indexed, so an
+    /// unreferenced object can never shadow a revision number.
+    fn index_chain(&self, head: Option<&str>) -> Result<()> {
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cur = head.map(str::to_owned);
+        while let Some(id) = cur {
+            if !seen.insert(id.clone()) {
+                return Err(VcsError::Protocol(format!("cycle in history at {id}")));
+            }
+            let c = storage::read_commit(self, &id)?;
+            cur = c.parent.clone();
+            chain.push(c);
+        }
+        chain.reverse();
+
+        let mut rows = Vec::with_capacity(chain.len());
+        let mut edges = Vec::new();
+        let mut prev_mergeinfo = BTreeMap::new();
+        for (idx, c) in chain.iter().enumerate() {
+            if c.revision != idx as i64 + 1 {
+                return Err(VcsError::Protocol(format!(
+                    "history is not numbered sequentially: commit {} is r{} at position {}",
+                    c.id,
+                    c.revision,
+                    idx + 1
+                )));
+            }
+            for (path, revs) in &c.mergeinfo {
+                let before: BTreeSet<i64> = prev_mergeinfo
+                    .get(path)
+                    .map(|v: &String| parse_mergeinfo_value(v).into_iter().collect())
+                    .unwrap_or_default();
+                for merged in parse_mergeinfo_value(revs) {
+                    if !before.contains(&merged) {
+                        edges.push((c.revision, merged, path.clone()));
+                    }
+                }
+            }
+            prev_mergeinfo = c.mergeinfo.clone();
+            rows.push(RevisionRow::from_commit(c)?);
+        }
+        self.wcdb()?.replace_revisions(&rows, &edges)
     }
 
     fn process_work_queue(&self) -> Result<()> {

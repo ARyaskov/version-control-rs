@@ -152,7 +152,6 @@ impl RaSession for FileRaSession {
         if let Some(head) = remote.head_commit_id()? {
             local.set_head_commit_id(&head)?;
         }
-        local.rebuild_revision_index()?;
         local.clear_local_lock_tokens()?;
         local.update_to_revision("HEAD")?;
         Ok(())
@@ -205,7 +204,6 @@ impl RaSession for FileRaSession {
 
         copy_store(&local.root, &remote.root)?;
         remote.set_head_commit_id(&local_head)?;
-        remote.rebuild_revision_index()?;
         Ok(())
     }
 
@@ -299,10 +297,6 @@ fn copy_store(from_root: &Path, to_root: &Path) -> Result<()> {
     fs::create_dir_all(&to_vcrs)?;
     copy_tree(&from_vcrs.join("objects"), &to_vcrs.join("objects"))?;
     copy_tree(&from_vcrs.join("commits"), &to_vcrs.join("commits"))?;
-    let from_head = from_vcrs.join("HEAD");
-    if from_head.exists() {
-        fs::copy(from_head, to_vcrs.join("HEAD"))?;
-    }
     Ok(())
 }
 

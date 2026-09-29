@@ -293,3 +293,63 @@ fn concurrent_commits_are_serialized() {
     }
     assert!(client.status().unwrap().is_empty());
 }
+
+#[test]
+fn legacy_head_file_and_journal_are_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "1\n");
+    client.commit("r1", "a").unwrap();
+    write(root, "a.txt", "2\n");
+    let c2 = client.commit("r2", "a").unwrap();
+    drop(client);
+
+    // Recreate the pre-0.3 layout: HEAD file, an empty revision index and a
+    // leftover journal of an interrupted transaction.
+    fs::write(root.join(".vcrs/HEAD"), &c2.id).unwrap();
+    let db = rusqlite::Connection::open(root.join(".vcrs/wc.db")).unwrap();
+    db.execute("DELETE FROM revisions", []).unwrap();
+    drop(db);
+    fs::create_dir_all(root.join(".vcrs/transactions")).unwrap();
+    fs::write(root.join(".vcrs/transactions/x.journal.json"), "[]").unwrap();
+
+    let client = Client::discover(root).unwrap();
+    assert_eq!(client.log(10).unwrap().len(), 2);
+    assert!(!root.join(".vcrs/HEAD").exists());
+    assert!(!root.join(".vcrs/transactions").exists());
+    assert_eq!(client.cat_revision_file("2", "a.txt").unwrap(), b"2\n");
+}
+
+#[test]
+fn unpublished_commit_object_does_not_move_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "1\n");
+    let c1 = client.commit("r1", "a").unwrap();
+
+    // Simulate a crash after the commit object was written but before the
+    // SQLite commit point: an orphan r2 object on disk.
+    let mut orphan = c1.clone();
+    orphan.id = "f".repeat(64);
+    orphan.revision = 2;
+    orphan.parent = Some(c1.id.clone());
+    fs::write(
+        root.join(".vcrs/commits")
+            .join(format!("{}.json", orphan.id)),
+        serde_json::to_vec(&orphan).unwrap(),
+    )
+    .unwrap();
+
+    let client = Client::discover(root).unwrap();
+    let log = client.log(10).unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].id, c1.id);
+
+    // The next real commit takes r2 and supersedes the orphan.
+    write(root, "a.txt", "2\n");
+    let c2 = client.commit("r2", "a").unwrap();
+    assert_eq!(c2.revision, 2);
+    assert_eq!(client.log(10).unwrap()[0].id, c2.id);
+}
