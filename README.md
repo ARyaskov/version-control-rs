@@ -30,8 +30,8 @@ Binary: `vcrs`
 
 ```bash
 vcrs init .
-vcrs checkout http://127.0.0.1:3690/svn/demo ./demo
-vcrs switch http://127.0.0.1:3690/svn/other
+vcrs checkout file:///srv/repos/demo ./demo   # remotes: file:// URLs or paths
+vcrs switch file:///srv/repos/other
 vcrs pull
 vcrs push
 
@@ -168,6 +168,14 @@ and only re-reads files whose metadata changed.
 - **`file://` access** is plain filesystem access: whoever can open the
   repository directory can read and write it, and the username is only used
   as lock owner. `authz.json`/`passwd.json` apply to the HTTP server only.
+
+### Remotes
+
+`checkout`, `switch`, `pull`, `push`, `lock` and `unlock` work with remote
+repositories on a filesystem path (`file:///path` or a plain path, e.g. a shared
+or mounted directory). There is no client for the HTTP protocol yet: URLs with
+other schemes (`http://`, `https://`, `svn://`) are rejected. The HTTP server
+below is for SVN/WebDAV clients.
 
 `serve-http` exposes a partial SVN/DAV compatibility layer intended as a foundation.
 Read/discovery/report paths are implemented first; full interoperability with a stock `svn` client

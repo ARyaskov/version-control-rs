@@ -185,13 +185,18 @@ impl RaSession for FileRaSession {
     }
 }
 
+/// Remote repositories are reached through the filesystem: `file://` URLs
+/// and plain paths. Other schemes (the `serve-http` protocol, `svn://`) have
+/// no client implementation and are rejected instead of being mistaken for
+/// local paths.
 fn resolve_remote_root(url: &str) -> Result<PathBuf> {
     if let Some(stripped) = url.strip_prefix("file://") {
         return Ok(PathBuf::from(stripped));
     }
-    if let Some(stripped) = url.strip_prefix("svn://") {
-        // Phase-1 compatibility: treat svn:// as filesystem path alias.
-        return Ok(PathBuf::from(stripped));
+    if let Some((scheme, _)) = url.split_once("://") {
+        return Err(VcsError::UnsupportedUrl(format!(
+            "{scheme}:// remotes are not supported by the client; use a file:// URL or a path"
+        )));
     }
     Ok(PathBuf::from(url))
 }

@@ -1220,3 +1220,19 @@ fn pull_transfers_only_reachable_verified_objects() {
     );
     assert!(!local.join("objects/dd").exists());
 }
+
+#[test]
+fn unsupported_remote_schemes_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    for url in [
+        "http://127.0.0.1:3690/svn/demo",
+        "svn://host/repo",
+        "https://x/y",
+    ] {
+        let err = Client::checkout_remote(url, dir.path().join("wc"), None).unwrap_err();
+        assert!(
+            matches!(err, version_control_rs::VcsError::UnsupportedUrl(_)),
+            "{url}: {err}"
+        );
+    }
+}

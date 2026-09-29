@@ -50,6 +50,8 @@ pub enum VcsError {
     NotVersioned(String),
     #[error("invalid repository path '{path}': {reason}")]
     InvalidPath { path: String, reason: &'static str },
+    #[error("unsupported repository URL: {0}")]
+    UnsupportedUrl(String),
     #[error("server misconfiguration: {0}")]
     ServerMisconfigured(String),
     #[error("nothing to commit: no local changes")]
