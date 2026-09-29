@@ -33,7 +33,11 @@ vcrs switch http://127.0.0.1:3690/svn/other
 vcrs pull
 vcrs push
 
-vcrs status
+vcrs add src/main.rs docs/      # put files/directories under version control
+vcrs add .                      # add every unversioned, non-ignored file
+vcrs rm old.txt [--keep-local]  # schedule a versioned file for deletion
+
+vcrs status                     # M/A/D for versioned changes, ? for unversioned files
 vcrs staged
 vcrs diff
 vcrs diff --path src/main.rs
@@ -92,6 +96,15 @@ Common aliases:
 - `vcrs commit` -> `vcrs ci`
 - `vcrs update` -> `vcrs up`
 
+### Versioned files
+
+Only files put under version control with `vcrs add` (or received from a
+checkout/update) are tracked; everything else is reported as `?` by `status`
+and is never committed, reverted or deleted by `vcrs`. `copy`/`move` record
+history explicitly, `rm` schedules a deletion, and deleting a versioned file
+from disk is committed as a deletion. `revert` restores versioned files to
+BASE and un-schedules additions (the files stay on disk, unversioned).
+
 ### Staging workflow
 
 `vcrs` supports an explicit staging area stored in `.vcrs/client-stage-index.json`.
@@ -111,7 +124,7 @@ Common aliases:
 ### Command reference
 
 - Working copy and remotes: `init`, `checkout`, `switch`, `pull`, `push`
-- Local file operations: `copy`, `move`, `revert`, `lock`, `unlock`
+- Local file operations: `add`, `rm`, `copy`, `move`, `revert`, `lock`, `unlock`
 - Inspection: `status`, `staged`, `diff`, `cat`, `log`, `changed`, `blame`, `hunks`
 - History and integration: `commit`, `update`, `merge`
 - Properties and grouping: `prop-set`, `prop-get`, `prop-del`, `iprop-set`, `iprop-list`, `changelist set|clear|list`

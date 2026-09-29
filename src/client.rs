@@ -77,6 +77,25 @@ impl Client {
         self.repo.status()
     }
 
+    /// Put files (or whole directories, minus ignored files) under version
+    /// control; they are committed with the next commit.
+    pub fn add(&self, paths: &[String]) -> Result<Vec<String>> {
+        let paths = normalize_all(paths);
+        self.repo.add(&paths)
+    }
+
+    /// Schedule versioned paths for deletion (removing them from disk unless
+    /// `keep_local`).
+    pub fn remove(&self, paths: &[String], keep_local: bool) -> Result<Vec<String>> {
+        let paths = normalize_all(paths);
+        self.repo.remove(&paths, keep_local)
+    }
+
+    /// Files on disk that are neither versioned nor ignored.
+    pub fn unversioned(&self) -> Result<Vec<String>> {
+        self.repo.unversioned()
+    }
+
     /// Remove unreferenced blobs from the object store.
     pub fn gc(&self) -> Result<GcStats> {
         self.repo.gc()
@@ -704,6 +723,10 @@ fn ensure_hunk_supported(change: &FileChange) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn normalize_all(paths: &[String]) -> Vec<String> {
+    paths.iter().map(|p| normalize_rel(p)).collect()
 }
 
 fn normalize_rel(path: &str) -> String {

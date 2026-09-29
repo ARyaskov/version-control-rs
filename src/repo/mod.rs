@@ -20,7 +20,7 @@ use crate::types::{
     BlameLine, ChangeKind, ChangedPath, ChangedPathAction, Commit, Depth, FileChange, FileEntry,
     RevisionRange,
 };
-use crate::wcdb::{ExternalDef, RevisionRow, WcDb};
+use crate::wcdb::{ExternalDef, RevisionRow, ScheduleOp, Scheduled, WcDb};
 
 pub(crate) const VCRS_DIR: &str = ".vcrs";
 
@@ -241,53 +241,45 @@ impl Repository {
         self.collect_working(true)
     }
 
+    /// Versioned files of the working copy: BASE paths not scheduled for
+    /// deletion plus scheduled additions. Unversioned files are never part of
+    /// the snapshot; a versioned file missing from disk is simply absent (and
+    /// therefore reported as deleted).
     fn collect_working(&self, persist: bool) -> Result<Vec<FileEntry>> {
         let wcdb = self.wcdb()?;
-        let depth = Depth::from_str(&wcdb.depth()?).unwrap_or(Depth::Infinity);
-        let ambient = wcdb.ambient_depth_map()?;
-        let ignore_set = build_ignore_globset(&self.collect_ignore_patterns(&wcdb)?);
-        let mut external_paths = BTreeSet::new();
-        for ex in wcdb.list_externals()? {
-            external_paths.insert(ex.path);
-        }
+        let base = self.base_files(&wcdb)?;
+        let schedule = wcdb.schedule()?;
+        let scope = WcScope::load(&wcdb)?;
         // One SQL round-trip each instead of two per file.
         let all_file_props = wcdb.all_file_props()?;
         let all_inherited = wcdb.all_inherited_props()?;
         let empty_props = BTreeMap::new();
 
         let mut entries = Vec::new();
-        let root = self.root.clone();
-        let walker = WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(move |e| !is_excluded_path(e.path(), &root));
-
-        for entry in walker {
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
+        for rel in versioned_paths(&base, &schedule) {
+            // BASE paths outside the working-copy depth are not materialized;
+            // explicitly scheduled additions always count.
+            if !schedule.contains_key(&rel) && !scope.contains(&rel) {
                 continue;
             }
-
-            // Names that cannot be represented as a valid repository path
-            // (reserved metadata, control characters, ...) are never tracked.
-            let Some(rel) = rel_from_fs(&self.root, path) else {
+            // Missing, replaced by a directory, or hidden behind a symlinked
+            // parent: not present in the working copy.
+            let Ok(abs) = self.abs_path(&rel) else {
                 continue;
             };
-
-            if ignore_set.is_match(&rel) || is_under_external(&rel, &external_paths) {
+            let Ok(md) = fs::symlink_metadata(&abs) else {
+                continue;
+            };
+            if md.is_dir() {
                 continue;
             }
-            if !path_allowed_by_ambient_depth(&rel, depth, &ambient) {
-                continue;
-            }
 
-            let is_symlink = entry.file_type().is_symlink();
+            let is_symlink = md.file_type().is_symlink();
             let raw = if is_symlink {
-                let target = fs::read_link(path)?;
+                let target = fs::read_link(&abs)?;
                 format!("link {}", target.to_string_lossy()).into_bytes()
             } else {
-                fs::read(path)?
+                fs::read(&abs)?
             };
 
             // A symlink is marked by svn:special; the exec bit on the link
@@ -295,7 +287,7 @@ impl Repository {
             #[cfg(unix)]
             let executable = {
                 use std::os::unix::fs::PermissionsExt;
-                !is_symlink && fs::symlink_metadata(path)?.permissions().mode() & 0o111 != 0
+                !is_symlink && md.permissions().mode() & 0o111 != 0
             };
             #[cfg(not(unix))]
             let executable = false;
@@ -306,9 +298,134 @@ impl Repository {
                 &rel, raw, is_symlink, executable, file_props, &inherited, persist,
             )?);
         }
-
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
+    }
+
+    /// Files present on disk that are neither versioned nor ignored.
+    pub fn unversioned(&self) -> Result<Vec<String>> {
+        let wcdb = self.wcdb()?;
+        let versioned = versioned_paths(&self.base_files(&wcdb)?, &wcdb.schedule()?);
+        let ignore = build_ignore_globset(&self.collect_ignore_patterns(&wcdb)?);
+        let scope = WcScope::load(&wcdb)?;
+        Ok(self
+            .walk_files(&self.root)?
+            .into_iter()
+            .filter(|rel| {
+                !versioned.contains(rel)
+                    && !ignore.is_match(rel)
+                    && !is_under_external(rel, &scope.externals)
+            })
+            .collect())
+    }
+
+    /// Every file or symlink below `dir` with a representable repository
+    /// path, sorted; metadata directories are pruned.
+    fn walk_files(&self, dir: &Path) -> Result<Vec<String>> {
+        let root = self.root.clone();
+        let walker = WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(move |e| !is_excluded_path(e.path(), &root));
+        let mut out = Vec::new();
+        for entry in walker {
+            let entry = entry?;
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            if let Some(rel) = rel_from_fs(&self.root, entry.path()) {
+                out.push(rel);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Files of the BASE revision (empty before the first update/commit).
+    fn base_files(&self, wcdb: &WcDb) -> Result<Vec<FileEntry>> {
+        let base_rev = wcdb.base_revision()?;
+        if base_rev == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self.read_commit_by_revision(base_rev)?.files)
+    }
+
+    /// Put paths under version control. Directories are added recursively,
+    /// skipping ignored files; naming an ignored file explicitly adds it.
+    /// Re-adding a path scheduled for deletion cancels the deletion.
+    pub fn add(&self, paths: &[String]) -> Result<Vec<String>> {
+        let _lock = self.lock()?;
+        let wcdb = self.wcdb()?;
+        let base: BTreeSet<String> = self
+            .base_files(&wcdb)?
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        let ignore = build_ignore_globset(&self.collect_ignore_patterns(&wcdb)?);
+        let mut added = BTreeSet::new();
+        for path in paths {
+            let abs = self.abs_path(path)?;
+            let md =
+                fs::symlink_metadata(&abs).map_err(|_| VcsError::PathNotFound(path.clone()))?;
+            let candidates = if md.is_dir() {
+                self.walk_files(&abs)?
+                    .into_iter()
+                    .filter(|rel| !ignore.is_match(rel))
+                    .collect()
+            } else {
+                vec![path.clone()]
+            };
+            let schedule = wcdb.schedule()?;
+            for rel in candidates {
+                match schedule.get(&rel) {
+                    Some(s) if s.op == ScheduleOp::Delete => {
+                        wcdb.clear_schedule(std::slice::from_ref(&rel))?;
+                        added.insert(rel);
+                    }
+                    Some(_) => {}
+                    None if base.contains(&rel) => {}
+                    None => {
+                        wcdb.set_schedule(&rel, ScheduleOp::Add, None)?;
+                        added.insert(rel);
+                    }
+                }
+            }
+        }
+        self.sync_wcdb()?;
+        Ok(added.into_iter().collect())
+    }
+
+    /// Schedule versioned paths (a directory means everything below it) for
+    /// deletion; scheduled additions are simply un-scheduled. Unless
+    /// `keep_local`, the files are removed from disk too.
+    pub fn remove(&self, paths: &[String], keep_local: bool) -> Result<Vec<String>> {
+        let _lock = self.lock()?;
+        let wcdb = self.wcdb()?;
+        let schedule = wcdb.schedule()?;
+        let versioned = versioned_paths(&self.base_files(&wcdb)?, &schedule);
+        let mut removed = Vec::new();
+        for path in paths {
+            crate::path::validate_rel_path(path)?;
+            let targets: Vec<&String> = versioned
+                .iter()
+                .filter(|v| path_in_scope(v, path))
+                .collect();
+            if targets.is_empty() {
+                return Err(VcsError::NotVersioned(path.clone()));
+            }
+            for rel in targets {
+                if schedule.get(rel).is_some_and(|s| s.op == ScheduleOp::Add) {
+                    wcdb.clear_schedule(std::slice::from_ref(rel))?;
+                } else {
+                    wcdb.set_schedule(rel, ScheduleOp::Delete, None)?;
+                }
+                if !keep_local && let Ok(abs) = self.abs_path(rel) {
+                    remove_path_if_exists(&abs)?;
+                }
+                removed.push(rel.clone());
+            }
+        }
+        self.sync_wcdb()?;
+        Ok(removed)
     }
 
     /// Build a single committed file entry from the working copy. `content`
@@ -421,8 +538,30 @@ impl Repository {
     ) -> Result<Commit> {
         let _lock = self.lock()?;
         self.ensure_initialized()?;
-        let snapshot = self.materialize_working_copy()?;
-        self.commit_entries(snapshot, message, author, revprops)
+        let schedule = self.wcdb()?.schedule()?;
+        let tree = self.working_commit_tree()?;
+        let committed: Vec<String> = schedule.keys().cloned().collect();
+        self.commit_entries(tree, message, author, revprops, &schedule, &committed)
+    }
+
+    /// The tree a full commit records: the versioned working files plus BASE
+    /// files outside the working-copy depth, carried over unchanged (a sparse
+    /// checkout must not delete what it did not materialize).
+    fn working_commit_tree(&self) -> Result<Vec<FileEntry>> {
+        let wcdb = self.wcdb()?;
+        let scope = WcScope::load(&wcdb)?;
+        let schedule = wcdb.schedule()?;
+        let mut tree: BTreeMap<String, FileEntry> = self
+            .materialize_working_copy()?
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect();
+        for f in self.base_files(&wcdb)? {
+            if !scope.contains(&f.path) && !schedule.contains_key(&f.path) {
+                tree.entry(f.path.clone()).or_insert(f);
+            }
+        }
+        Ok(tree.into_values().collect())
     }
 
     /// Commit an explicit, already-persisted set of file entries as the next
@@ -434,6 +573,8 @@ impl Repository {
         message: &str,
         author: &str,
         mut revprops: BTreeMap<String, String>,
+        schedule: &BTreeMap<String, Scheduled>,
+        committed_schedule: &[String],
     ) -> Result<Commit> {
         let wcdb = self.wcdb()?;
 
@@ -445,7 +586,9 @@ impl Repository {
         }
 
         let parent = self.head_commit()?;
-        let changed = compute_changed_files(parent.as_ref().map(|c| c.files.as_slice()), &snapshot);
+        let mut changed =
+            compute_changed_files(parent.as_ref().map(|c| c.files.as_slice()), &snapshot);
+        apply_scheduled_copies(&mut changed, schedule);
         let parent_revision = parent.as_ref().map(|c| c.revision);
         // Consumed atomically with the revision itself (see record_commit), so
         // a failed or interrupted commit never loses recorded merges.
@@ -557,6 +700,7 @@ impl Repository {
             &RevisionRow::from_commit(&commit)?,
             &pending_merges,
             next_rev,
+            committed_schedule,
         )?;
 
         // Working-copy node metadata is derived data: the commit is already
@@ -579,15 +723,21 @@ impl Repository {
     ) -> Result<Commit> {
         let _lock = self.lock()?;
         self.ensure_initialized()?;
-        let head_files = self.head_commit()?.map(|c| c.files).unwrap_or_default();
-        let mut result: BTreeMap<String, FileEntry> = head_files
+        let wcdb = self.wcdb()?;
+        let schedule = wcdb.schedule()?;
+        let mut result: BTreeMap<String, FileEntry> = self
+            .base_files(&wcdb)?
             .into_iter()
             .map(|f| (f.path.clone(), f))
             .collect();
 
         for path in staged_full {
+            let scheduled = schedule.get(path).map(|s| s.op);
+            if scheduled.is_none() && !result.contains_key(path) {
+                return Err(VcsError::NotVersioned(path.clone()));
+            }
             let abs = self.abs_path(path)?;
-            if fs::symlink_metadata(&abs).is_ok() {
+            if scheduled != Some(ScheduleOp::Delete) && fs::symlink_metadata(&abs).is_ok() {
                 result.insert(path.clone(), self.working_entry(path, None, true)?);
             } else {
                 result.remove(path);
@@ -599,12 +749,18 @@ impl Repository {
                 self.working_entry(path, Some(text.clone().into_bytes()), true)?,
             );
         }
+        let committed: Vec<String> = staged_full
+            .iter()
+            .chain(staged_partial.keys())
+            .filter(|p| schedule.contains_key(*p))
+            .cloned()
+            .collect();
 
         let snapshot: Vec<FileEntry> = result.into_values().collect();
         let mut revprops = BTreeMap::new();
         revprops.insert("svn:author".to_owned(), author.to_owned());
         revprops.insert("svn:log".to_owned(), message.to_owned());
-        self.commit_entries(snapshot, message, author, revprops)
+        self.commit_entries(snapshot, message, author, revprops, &schedule, &committed)
     }
 
     pub fn log(&self, limit: usize) -> Result<Vec<Commit>> {
@@ -672,37 +828,132 @@ impl Repository {
         self.sync_wcdb_from(&working)
     }
 
+    /// Revert local changes to the BASE revision: restore modified and missing
+    /// files and their properties, cancel scheduled deletions, and un-schedule
+    /// additions (the files stay on disk, unversioned). Unversioned files are
+    /// never touched. `only_paths` limits the revert to those paths or
+    /// directories; empty means everything.
     pub fn revert_to_head(&self, only_paths: &[String]) -> Result<Vec<FileChange>> {
         let _lock = self.lock()?;
-        let Some(head) = self.head_commit()? else {
-            return Ok(Vec::new());
+        let before = self.status()?;
+        let wcdb = self.wcdb()?;
+        let base_rev = wcdb.base_revision()?;
+        let base_commit = if base_rev == 0 {
+            None
+        } else {
+            Some(self.read_commit_by_revision(base_rev)?)
         };
+        let base_map: BTreeMap<&str, &FileEntry> = base_commit
+            .iter()
+            .flat_map(|c| c.files.iter())
+            .map(|f| (f.path.as_str(), f))
+            .collect();
+        let selected =
+            |p: &str| only_paths.is_empty() || only_paths.iter().any(|o| path_in_scope(p, o));
 
-        let changed = self.restore_snapshot(&head.files, only_paths)?;
+        let unschedule: Vec<String> = wcdb
+            .schedule()?
+            .into_keys()
+            .filter(|p| selected(p))
+            .collect();
+        wcdb.clear_schedule(&unschedule)?;
+
+        let mut reverted = Vec::new();
+        for ch in before {
+            if !selected(&ch.path) {
+                continue;
+            }
+            if let Some(entry) = base_map.get(ch.path.as_str()) {
+                let abs = self.abs_path(&ch.path)?;
+                if let Some(parent) = abs.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let blob = self.read_blob(&entry.blob_id)?;
+                write_entry_to_working(
+                    &abs,
+                    entry,
+                    &blob,
+                    base_commit.as_ref().map(|c| c.revision),
+                    base_commit.as_ref().map(|c| c.author.as_str()),
+                    base_commit.as_ref().map(|c| c.created_at),
+                    wcdb.has_lock_token(&ch.path)?,
+                )?;
+                wcdb.replace_props_for_path(&ch.path, &entry.props)?;
+            }
+            reverted.push(ch);
+        }
         self.sync_wcdb()?;
-        Ok(changed)
+        Ok(reverted)
     }
 
+    /// Copy a versioned file, scheduling the copy for addition with history.
     pub fn copy_path(&self, src: &str, dst: &str) -> Result<()> {
         let _lock = self.lock()?;
-        let src_abs = self.abs_path(src)?;
-        let dst_abs = self.abs_path(dst)?;
-        if let Some(parent) = dst_abs.parent() {
-            fs::create_dir_all(parent)?;
+        let wcdb = self.wcdb()?;
+        let origin = self.copy_origin(&wcdb, src)?;
+        let (src_abs, dst_abs) = self.copy_endpoints(src, dst)?;
+        let md = fs::symlink_metadata(&src_abs)?;
+        if md.file_type().is_symlink() {
+            try_create_symlink(&dst_abs, &fs::read_link(&src_abs)?.to_string_lossy())?;
+        } else {
+            fs::copy(&src_abs, &dst_abs)?;
         }
-        fs::copy(src_abs, dst_abs)?;
+        wcdb.set_schedule(dst, ScheduleOp::Add, origin.as_deref())?;
         self.sync_wcdb()
     }
 
+    /// Move a versioned file: the destination is scheduled for addition with
+    /// history and the source for deletion.
     pub fn move_path(&self, src: &str, dst: &str) -> Result<()> {
         let _lock = self.lock()?;
+        let wcdb = self.wcdb()?;
+        let origin = self.copy_origin(&wcdb, src)?;
+        let (src_abs, dst_abs) = self.copy_endpoints(src, dst)?;
+        fs::rename(&src_abs, &dst_abs)?;
+        wcdb.set_schedule(dst, ScheduleOp::Add, origin.as_deref())?;
+        if wcdb
+            .schedule()?
+            .get(src)
+            .is_some_and(|s| s.op == ScheduleOp::Add)
+        {
+            wcdb.clear_schedule(&[src.to_owned()])?;
+        } else {
+            wcdb.set_schedule(src, ScheduleOp::Delete, None)?;
+        }
+        self.sync_wcdb()
+    }
+
+    /// The history a copy of `path` records: the path itself when it is in
+    /// BASE, the original source when it is itself a scheduled copy.
+    fn copy_origin(&self, wcdb: &WcDb, path: &str) -> Result<Option<String>> {
+        match wcdb.schedule()?.get(path) {
+            Some(s) if s.op == ScheduleOp::Add => Ok(s.copy_from.clone()),
+            Some(_) => Err(VcsError::NotVersioned(path.to_owned())),
+            None if self.base_files(wcdb)?.iter().any(|f| f.path == path) => {
+                Ok(Some(path.to_owned()))
+            }
+            None => Err(VcsError::NotVersioned(path.to_owned())),
+        }
+    }
+
+    fn copy_endpoints(&self, src: &str, dst: &str) -> Result<(PathBuf, PathBuf)> {
         let src_abs = self.abs_path(src)?;
         let dst_abs = self.abs_path(dst)?;
+        let md =
+            fs::symlink_metadata(&src_abs).map_err(|_| VcsError::PathNotFound(src.to_owned()))?;
+        if md.is_dir() {
+            return Err(VcsError::InvalidPath {
+                path: src.to_owned(),
+                reason: "copying or moving directories is not supported",
+            });
+        }
+        if fs::symlink_metadata(&dst_abs).is_ok() {
+            return Err(VcsError::PathExists(dst.to_owned()));
+        }
         if let Some(parent) = dst_abs.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(src_abs, dst_abs)?;
-        self.sync_wcdb()
+        Ok((src_abs, dst_abs))
     }
 
     pub fn update_to_revision(&self, revision: &str) -> Result<Vec<FileChange>> {
@@ -723,8 +974,8 @@ impl Repository {
         let target = self.read_commit_by_revision(target_rev)?;
         let outcome =
             self.apply_revision_with_conflicts(target_rev, &target.files, None, true, false)?;
-        if let Some(d) = depth {
-            self.prune_working_to_depth(d)?;
+        if depth.is_some() {
+            self.prune_working_to_depth()?;
         }
         self.sync_wcdb()?;
         Ok(outcome.changed)
@@ -1249,23 +1500,25 @@ impl Repository {
         Ok(())
     }
 
-    fn prune_working_to_depth(&self, depth: Depth) -> Result<()> {
-        let ambient = self.wcdb()?.ambient_depth_map()?;
-        let root = self.root.clone();
-        let walker = WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(move |e| !is_excluded_path(e.path(), &root));
-        for entry in walker {
-            let entry = entry?;
-            if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
+    /// After the depth was narrowed, remove BASE files that fell out of the
+    /// working-copy scope — only unmodified ones. Local modifications, scheduled
+    /// changes and unversioned files are never deleted.
+    fn prune_working_to_depth(&self) -> Result<()> {
+        let wcdb = self.wcdb()?;
+        let scope = WcScope::load(&wcdb)?;
+        let schedule = wcdb.schedule()?;
+        for f in self.base_files(&wcdb)? {
+            if scope.contains(&f.path) || schedule.contains_key(&f.path) {
                 continue;
             }
-            let Some(rel) = rel_from_fs(&self.root, entry.path()) else {
+            let Ok(abs) = self.abs_path(&f.path) else {
                 continue;
             };
-            if !path_allowed_by_ambient_depth(&rel, depth, &ambient) {
-                let _ = remove_path_if_exists(entry.path());
+            if !fs::symlink_metadata(&abs).is_ok_and(|m| !m.is_dir()) {
+                continue;
+            }
+            if self.working_entry(&f.path, None, false)?.blob_id == f.blob_id {
+                remove_path_if_exists(&abs)?;
             }
         }
         Ok(())
@@ -1281,14 +1534,8 @@ impl Repository {
     ) -> Result<MergeOutcome> {
         let target_meta = self.read_commit_by_revision(rev).ok();
         let wcdb = self.wcdb()?;
-        let depth = Depth::from_str(&wcdb.depth()?).unwrap_or(Depth::Infinity);
-        let ambient = wcdb.ambient_depth_map()?;
-        let base_rev = wcdb.base_revision()?;
-        let base_files = if base_rev == 0 {
-            Vec::new()
-        } else {
-            self.read_commit_by_revision(base_rev)?.files
-        };
+        let scope = WcScope::load(&wcdb)?;
+        let base_files = self.base_files(&wcdb)?;
         let working = self.snapshot_working_copy()?;
 
         let base_map: BTreeMap<&str, &FileEntry> =
@@ -1316,7 +1563,7 @@ impl Repository {
                     continue;
                 }
             }
-            if !path_allowed_by_ambient_depth(path, depth, &ambient) {
+            if !scope.contains(path) {
                 continue;
             }
             let b = base_map.get(path).copied();
@@ -1327,6 +1574,34 @@ impl Repository {
             let incoming_changed = changed_entry(b, t);
 
             if !incoming_changed {
+                continue;
+            }
+
+            // An unversioned file stands where an addition arrives: never
+            // overwrite it. Identical content is adopted as is.
+            if b.is_none()
+                && w.is_none()
+                && let Some(te) = t
+                && let Ok(abs) = self.abs_path(path)
+                && fs::symlink_metadata(&abs).is_ok()
+            {
+                let identical = fs::symlink_metadata(&abs)?.is_file()
+                    && self
+                        .working_entry(path, None, false)
+                        .is_ok_and(|e| e.blob_id == te.blob_id);
+                if !identical {
+                    conflicts.push(path.to_string());
+                    if dry_run {
+                        planned.push(incoming_change(path, b, t));
+                    } else {
+                        wcdb.set_tree_conflict(path, "local unversioned, incoming add")?;
+                    }
+                    continue;
+                }
+                planned.push(incoming_change(path, b, t));
+                if !dry_run && !advance_base {
+                    wcdb.set_schedule(path, ScheduleOp::Add, None)?;
+                }
                 continue;
             }
 
@@ -1373,9 +1648,18 @@ impl Repository {
             }
 
             // no conflict, apply target state
+            planned.push(incoming_change(path, b, t));
             if dry_run {
-                planned.push(incoming_change(path, b, t));
                 continue;
+            }
+            // A merge changes the working copy relative to BASE, so additions
+            // and deletions it brings are scheduled for the next commit.
+            if !advance_base {
+                match (b, t) {
+                    (None, Some(_)) => wcdb.set_schedule(path, ScheduleOp::Add, None)?,
+                    (Some(_), None) => wcdb.set_schedule(path, ScheduleOp::Delete, None)?,
+                    _ => {}
+                }
             }
             match t {
                 Some(te) => {
@@ -1407,63 +1691,15 @@ impl Repository {
             });
         }
 
-        let changed = self.status()?;
         if conflicts.is_empty() && advance_base {
             wcdb.set_base_revision(rev)?;
+            reconcile_schedule(&wcdb, target_files)?;
         }
 
-        Ok(MergeOutcome { changed, conflicts })
-    }
-
-    fn restore_snapshot(
-        &self,
-        snapshot: &[FileEntry],
-        only_paths: &[String],
-    ) -> Result<Vec<FileChange>> {
-        let filter: Option<BTreeSet<&str>> = if only_paths.is_empty() {
-            None
-        } else {
-            Some(only_paths.iter().map(String::as_str).collect())
-        };
-
-        let before = self.snapshot_working_copy()?;
-        let before_map: BTreeMap<&str, &FileEntry> =
-            before.iter().map(|e| (e.path.as_str(), e)).collect();
-        let target_map: BTreeMap<&str, &FileEntry> =
-            snapshot.iter().map(|e| (e.path.as_str(), e)).collect();
-
-        for (path, entry) in &target_map {
-            if filter.as_ref().is_some_and(|f| !f.contains(path)) {
-                continue;
-            }
-            let abs = self.abs_path(path)?;
-            if let Some(parent) = abs.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let blob = self.read_blob(&entry.blob_id)?;
-            let head = self.head_commit()?;
-            write_entry_to_working(
-                &abs,
-                entry,
-                &blob,
-                head.as_ref().map(|c| c.revision),
-                head.as_ref().map(|c| c.author.as_str()),
-                head.as_ref().map(|c| c.created_at),
-                self.wcdb()?.has_lock_token(path)?,
-            )?;
-        }
-
-        for path in before_map.keys() {
-            if filter.as_ref().is_some_and(|f| !f.contains(path)) {
-                continue;
-            }
-            if !target_map.contains_key(path) {
-                remove_path_if_exists(&self.abs_path(path)?)?;
-            }
-        }
-
-        let after = self.snapshot_working_copy()?;
-        Ok(compute_changed_files(Some(&before), &after))
+        Ok(MergeOutcome {
+            changed: planned,
+            conflicts,
+        })
     }
 
     fn sync_wcdb(&self) -> Result<()> {
@@ -1476,15 +1712,17 @@ impl Repository {
     /// and return the change set relative to the base revision.
     fn sync_wcdb_from(&self, working: &[FileEntry]) -> Result<Vec<FileChange>> {
         let wcdb = self.wcdb()?;
-        let base_rev = wcdb.base_revision()?;
-        let base_files = if base_rev == 0 {
-            Vec::new()
-        } else {
-            self.read_commit_by_revision(base_rev)
-                .map(|c| c.files)
-                .unwrap_or_default()
-        };
-        let changes = compute_changed_files(Some(&base_files), working);
+        let schedule = wcdb.schedule()?;
+        let scope = WcScope::load(&wcdb)?;
+        // BASE files outside the working-copy depth are not materialized and
+        // must not be reported as deleted.
+        let base_files: Vec<FileEntry> = self
+            .base_files(&wcdb)?
+            .into_iter()
+            .filter(|f| scope.contains(&f.path) || schedule.contains_key(&f.path))
+            .collect();
+        let mut changes = compute_changed_files(Some(&base_files), working);
+        apply_scheduled_copies(&mut changes, &schedule);
         wcdb.replace_nodes(&base_files, working, &changes)?;
         wcdb.replace_file_props_from_entries(working)?;
         Ok(changes)
@@ -1512,6 +1750,93 @@ impl Repository {
         }
 
         Ok(patterns)
+    }
+}
+
+/// Which BASE paths the working copy materializes (sparse depth, externals).
+struct WcScope {
+    depth: Depth,
+    ambient: BTreeMap<String, (String, bool)>,
+    externals: BTreeSet<String>,
+}
+
+impl WcScope {
+    fn load(wcdb: &WcDb) -> Result<Self> {
+        Ok(Self {
+            depth: Depth::from_str(&wcdb.depth()?).unwrap_or(Depth::Infinity),
+            ambient: wcdb.ambient_depth_map()?,
+            externals: wcdb.list_externals()?.into_iter().map(|e| e.path).collect(),
+        })
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        !is_under_external(path, &self.externals)
+            && path_allowed_by_ambient_depth(path, self.depth, &self.ambient)
+    }
+}
+
+/// The versioned set: BASE paths not scheduled for deletion plus scheduled
+/// additions.
+fn versioned_paths(base: &[FileEntry], schedule: &BTreeMap<String, Scheduled>) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = base
+        .iter()
+        .filter(|f| {
+            schedule
+                .get(&f.path)
+                .is_none_or(|s| s.op != ScheduleOp::Delete)
+        })
+        .map(|f| f.path.clone())
+        .collect();
+    out.extend(
+        schedule
+            .iter()
+            .filter(|(_, s)| s.op == ScheduleOp::Add)
+            .map(|(p, _)| p.clone()),
+    );
+    out
+}
+
+/// After BASE moved, drop schedule entries the new BASE already satisfies:
+/// additions that now exist and deletions that are gone.
+fn reconcile_schedule(wcdb: &WcDb, new_base: &[FileEntry]) -> Result<()> {
+    let present: BTreeSet<&str> = new_base.iter().map(|f| f.path.as_str()).collect();
+    let stale: Vec<String> = wcdb
+        .schedule()?
+        .into_iter()
+        .filter(|(p, s)| (s.op == ScheduleOp::Add) == present.contains(p.as_str()))
+        .map(|(p, _)| p)
+        .collect();
+    wcdb.clear_schedule(&stale)
+}
+
+/// Explicit copy/move records (from `copy`/`move`) win over the content-based
+/// rename/copy heuristics.
+fn apply_scheduled_copies(changes: &mut [FileChange], schedule: &BTreeMap<String, Scheduled>) {
+    let deleted: BTreeSet<String> = changes
+        .iter()
+        .filter(|c| c.kind == ChangeKind::Deleted)
+        .map(|c| c.path.clone())
+        .collect();
+    let mut moves = Vec::new();
+    for ch in changes.iter_mut() {
+        if ch.kind != ChangeKind::Added {
+            continue;
+        }
+        if let Some(src) = schedule.get(&ch.path).and_then(|s| s.copy_from.clone()) {
+            ch.moved_from = deleted.contains(&src).then(|| src.clone());
+            if ch.moved_from.is_some() {
+                moves.push((src.clone(), ch.path.clone()));
+            }
+            ch.copy_from = Some(src);
+        }
+    }
+    for (from, to) in moves {
+        if let Some(del) = changes
+            .iter_mut()
+            .find(|c| c.kind == ChangeKind::Deleted && c.path == from)
+        {
+            del.moved_to = Some(to);
+        }
     }
 }
 

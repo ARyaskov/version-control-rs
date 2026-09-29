@@ -452,17 +452,17 @@ fn apply_activity_commit(
         }
         std::fs::write(abs, bytes)?;
     }
+    // New files must be put under version control explicitly.
+    let paths: Vec<String> = activity.files.keys().cloned().collect();
+    client.add(&paths)?;
     for rel in &activity.deletes {
         // A path re-added in the same activity must not be deleted.
         if activity.files.contains_key(rel) {
             continue;
         }
-        let abs = join_repo_path(repo_root, rel)?;
-        match std::fs::symlink_metadata(&abs) {
-            Ok(md) if md.is_dir() => std::fs::remove_dir_all(&abs)?,
-            Ok(_) => std::fs::remove_file(&abs)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(VcsError::Io(e)),
+        match client.remove(std::slice::from_ref(rel), false) {
+            Ok(_) | Err(VcsError::NotVersioned(_)) => {}
+            Err(e) => return Err(e),
         }
     }
     for (rel, props) in &activity.props {

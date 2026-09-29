@@ -9,11 +9,26 @@ use crate::types::{Commit, FileChange, FileEntry};
 
 /// Bump when the schema below changes so existing working copies re-run the
 /// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub struct WcDb {
     conn: Connection,
+}
+
+/// A pending local change to the versioned set: `add` puts an unversioned
+/// path under version control (optionally recording its copy source),
+/// `delete` removes a BASE path at the next commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleOp {
+    Add,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scheduled {
+    pub op: ScheduleOp,
+    pub copy_from: Option<String>,
 }
 
 /// One row of the revision index.
@@ -195,6 +210,12 @@ impl WcDb {
                 path TEXT PRIMARY KEY,
                 token TEXT NOT NULL,
                 owner TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS schedule (
+                path TEXT PRIMARY KEY,
+                op TEXT NOT NULL,
+                copy_from TEXT
             );
 
             CREATE TABLE IF NOT EXISTS ambient_depth (
@@ -496,6 +517,24 @@ impl WcDb {
         Ok(())
     }
 
+    /// Replace all properties of one path (e.g. when reverting to BASE).
+    pub fn replace_props_for_path(
+        &self,
+        path: &str,
+        props: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.with_write_tx(|tx| {
+            tx.execute("DELETE FROM file_props WHERE path=?1", params![path])?;
+            for (name, value) in props {
+                tx.execute(
+                    "INSERT INTO file_props(path, name, value) VALUES(?1,?2,?3)",
+                    params![path, name, value],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn delete_file_prop(&self, path: &str, name: &str) -> Result<()> {
         self.with_write_tx(|tx| {
             tx.execute(
@@ -699,9 +738,13 @@ impl WcDb {
         row: &RevisionRow,
         merged: &[(String, i64)],
         new_base: i64,
+        committed_schedule: &[String],
     ) -> Result<()> {
         self.with_write_tx(|tx| {
             insert_revision(tx, row)?;
+            for path in committed_schedule {
+                tx.execute("DELETE FROM schedule WHERE path=?1", params![path])?;
+            }
             for (source_path, merged_rev) in merged {
                 tx.execute(
                     "INSERT OR IGNORE INTO merge_edges(target_rev, merged_rev, source_path) VALUES(?1,?2,?3)",
@@ -731,6 +774,53 @@ impl WcDb {
                     "INSERT OR IGNORE INTO merge_edges(target_rev, merged_rev, source_path) VALUES(?1,?2,?3)",
                     params![target_rev, merged_rev, source_path],
                 )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn schedule(&self) -> Result<BTreeMap<String, Scheduled>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, op, copy_from FROM schedule")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (path, op, copy_from) = row?;
+            let op = if op == "delete" {
+                ScheduleOp::Delete
+            } else {
+                ScheduleOp::Add
+            };
+            out.insert(path, Scheduled { op, copy_from });
+        }
+        Ok(out)
+    }
+
+    pub fn set_schedule(&self, path: &str, op: ScheduleOp, copy_from: Option<&str>) -> Result<()> {
+        let op = match op {
+            ScheduleOp::Add => "add",
+            ScheduleOp::Delete => "delete",
+        };
+        self.with_write_tx(|tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO schedule(path, op, copy_from) VALUES(?1,?2,?3)",
+                params![path, op, copy_from],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn clear_schedule(&self, paths: &[String]) -> Result<()> {
+        self.with_write_tx(|tx| {
+            for path in paths {
+                tx.execute("DELETE FROM schedule WHERE path=?1", params![path])?;
             }
             Ok(())
         })

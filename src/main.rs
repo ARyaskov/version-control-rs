@@ -20,6 +20,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Init(InitArgs),
+    /// Put files or directories under version control.
+    Add(StageArgs),
+    /// Schedule versioned files for deletion.
+    #[command(alias = "remove", alias = "delete")]
+    Rm(RmArgs),
     #[command(alias = "co")]
     Checkout(CheckoutArgs),
     Switch(SwitchArgs),
@@ -180,6 +185,14 @@ struct StageArgs {
 }
 
 #[derive(Args, Debug)]
+struct RmArgs {
+    paths: Vec<String>,
+    /// Keep the files on disk (they become unversioned).
+    #[arg(long)]
+    keep_local: bool,
+}
+
+#[derive(Args, Debug)]
 struct HunksArgs {
     path: String,
 }
@@ -319,6 +332,43 @@ fn run(cli: Cli) -> Result<()> {
                 println!("Initialized repository at {}", client.root().display());
             }
         }
+        Commands::Add(args) => {
+            let client = Client::discover(".")?;
+            let mut paths = Vec::new();
+            for p in &args.paths {
+                let rel = resolve_user_path(&client, p)?;
+                // "vcrs add ." adds the whole tree.
+                paths.push(if rel.is_empty() { ".".to_owned() } else { rel });
+            }
+            let added = if paths.iter().any(|p| p == ".") {
+                client.add(&client.unversioned()?)?
+            } else {
+                client.add(&paths)?
+            };
+            if json_output {
+                print_json(json!({"ok": true, "command": "add", "added": added}))?;
+            } else {
+                for p in added {
+                    println!("A  {p}");
+                }
+            }
+        }
+        Commands::Rm(args) => {
+            let client = Client::discover(".")?;
+            let paths = args
+                .paths
+                .iter()
+                .map(|p| repo_path(&client, p))
+                .collect::<Result<Vec<_>>>()?;
+            let removed = client.remove(&paths, args.keep_local)?;
+            if json_output {
+                print_json(json!({"ok": true, "command": "rm", "removed": removed}))?;
+            } else {
+                for p in removed {
+                    println!("D  {p}");
+                }
+            }
+        }
         Commands::Checkout(args) => {
             let client = Client::checkout_remote(&args.url, &args.path, args.username.as_deref())?;
             if let Some(depth) = args.depth.as_deref().and_then(Depth::from_str) {
@@ -422,18 +472,23 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Status => {
             let client = Client::discover(".")?;
             let status = client.status()?;
+            let unversioned = client.unversioned()?;
             if json_output {
                 print_json(json!({
                     "ok": true,
                     "command": "status",
                     "clean": status.is_empty(),
                     "items": status,
+                    "unversioned": unversioned,
                 }))?;
-            } else if status.is_empty() {
+            } else if status.is_empty() && unversioned.is_empty() {
                 println!("Working copy clean");
             } else {
                 for ch in status {
                     println!("{}", format_status_line(&ch));
+                }
+                for path in unversioned {
+                    println!("?  {path}");
                 }
             }
         }

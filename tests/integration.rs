@@ -14,6 +14,11 @@ fn write(root: &Path, rel: &str, content: &str) {
     fs::write(abs, content).unwrap();
 }
 
+fn add(client: &Client, paths: &[&str]) {
+    let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+    client.add(&paths).unwrap();
+}
+
 fn read(root: &Path, rel: &str) -> String {
     fs::read_to_string(root.join(rel)).unwrap()
 }
@@ -25,6 +30,7 @@ fn commit_status_cat_roundtrip() {
     let client = Client::init(root).unwrap();
 
     write(root, "a.txt", "alpha\nbeta\n");
+    add(&client, &["a.txt"]);
     let c1 = client.commit("r1", "alice").unwrap();
     assert_eq!(c1.revision, 1);
     assert!(client.status().unwrap().is_empty(), "clean after commit");
@@ -46,6 +52,7 @@ fn update_and_revert() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "f.txt", "v1\n");
+    add(&client, &["f.txt"]);
     client.commit("r1", "a").unwrap();
     write(root, "f.txt", "v2\n");
     client.commit("r2", "a").unwrap();
@@ -67,6 +74,7 @@ fn staged_commit_preserves_unstaged() {
     let client = Client::init(root).unwrap();
     write(root, "a.txt", "a\n");
     write(root, "b.txt", "b\n");
+    add(&client, &["a.txt", "b.txt"]);
     client.commit("r1", "a").unwrap();
 
     write(root, "a.txt", "A\n");
@@ -86,6 +94,7 @@ fn commit_rejects_conflict_markers() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "c.txt", "ok\n");
+    add(&client, &["c.txt"]);
     client.commit("r1", "a").unwrap();
     write(
         root,
@@ -106,6 +115,7 @@ fn rename_detected_but_not_for_empty_files() {
     let client = Client::init(root).unwrap();
     write(root, "unique.txt", "a distinctive line of content\n");
     write(root, "empty1.txt", "");
+    add(&client, &["unique.txt", "empty1.txt"]);
     client.commit("r1", "a").unwrap();
 
     // Rename the unique file and the empty file.
@@ -113,6 +123,7 @@ fn rename_detected_but_not_for_empty_files() {
     write(root, "renamed.txt", "a distinctive line of content\n");
     fs::remove_file(root.join("empty1.txt")).unwrap();
     write(root, "empty2.txt", "");
+    add(&client, &["renamed.txt", "empty2.txt"]);
 
     let st = client.status().unwrap();
     let renamed = st.iter().find(|c| c.path == "renamed.txt").unwrap();
@@ -134,6 +145,7 @@ fn eol_style_not_auto_injected() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "t.txt", "line1\nline2\n");
+    add(&client, &["t.txt"]);
     client.commit("r1", "a").unwrap();
 
     let repo = Repository::discover(root).unwrap();
@@ -153,6 +165,7 @@ fn unified_diff_has_hunk_headers() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n");
+    add(&client, &["f.txt"]);
     client.commit("r1", "a").unwrap();
     write(root, "f.txt", "1\n2\n3\nFOUR\n5\n6\n7\n8\n");
 
@@ -171,6 +184,7 @@ fn gc_removes_unreferenced_blobs() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "keep.txt", "referenced content\n");
+    add(&client, &["keep.txt"]);
     client.commit("r1", "a").unwrap();
 
     // Inject an orphan blob.
@@ -194,6 +208,7 @@ fn symbolic_revisions_resolve() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "f.txt", "1\n");
+    add(&client, &["f.txt"]);
     client.commit("r1", "a").unwrap();
     write(root, "f.txt", "2\n");
     client.commit("r2", "a").unwrap();
@@ -211,6 +226,7 @@ fn checkout_rejects_paths_escaping_the_working_copy() {
     let remote = dir.path().join("remote");
     let client = Client::init(&remote).unwrap();
     write(&remote, "payload.txt", "x\n");
+    add(&client, &["payload.txt"]);
     let c = client.commit("r1", "a").unwrap();
 
     // Tamper with the stored commit the way a malicious remote could.
@@ -234,6 +250,7 @@ fn update_does_not_follow_dangling_symlink() {
     let outside = dir.path().join("outside.txt");
     let client = Client::init(&root).unwrap();
     write(&root, "f.txt", "v1\n");
+    add(&client, &["f.txt"]);
     client.commit("r1", "a").unwrap();
     write(&root, "f.txt", "v2\n");
     client.commit("r2", "a").unwrap();
@@ -258,6 +275,7 @@ fn hooks_can_be_disabled() {
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
 
     write(root, "a.txt", "a\n");
+    add(&client, &["a.txt"]);
     assert!(client.commit("r1", "a").is_err(), "enabled hook rejects");
     let client = client.with_hooks(false);
     assert_eq!(client.commit("r1", "a").unwrap().revision, 1);
@@ -274,7 +292,9 @@ fn concurrent_commits_are_serialized() {
             std::thread::spawn(move || {
                 let client = Client::discover(&root).unwrap();
                 for i in 0..5 {
-                    write(&root, &format!("t{t}/f{i}.txt"), &format!("{t}-{i}\n"));
+                    let path = format!("t{t}/f{i}.txt");
+                    write(&root, &path, &format!("{t}-{i}\n"));
+                    client.add(&[path]).unwrap();
                     client.commit(&format!("t{t} c{i}"), "a").unwrap();
                 }
             })
@@ -300,6 +320,7 @@ fn legacy_head_file_and_journal_are_migrated() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "a.txt", "1\n");
+    add(&client, &["a.txt"]);
     client.commit("r1", "a").unwrap();
     write(root, "a.txt", "2\n");
     let c2 = client.commit("r2", "a").unwrap();
@@ -327,6 +348,7 @@ fn unpublished_commit_object_does_not_move_head() {
     let root = dir.path();
     let client = Client::init(root).unwrap();
     write(root, "a.txt", "1\n");
+    add(&client, &["a.txt"]);
     let c1 = client.commit("r1", "a").unwrap();
 
     // Simulate a crash after the commit object was written but before the
@@ -352,4 +374,122 @@ fn unpublished_commit_object_does_not_move_head() {
     let c2 = client.commit("r2", "a").unwrap();
     assert_eq!(c2.revision, 2);
     assert_eq!(client.log(10).unwrap()[0].id, c2.id);
+}
+
+#[test]
+fn unversioned_files_are_listed_but_never_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "a\n");
+    add(&client, &["a.txt"]);
+    client.commit("r1", "a").unwrap();
+
+    write(root, "secret.env", "TOKEN=x\n");
+    assert!(client.status().unwrap().is_empty());
+    assert_eq!(client.unversioned().unwrap(), vec!["secret.env".to_owned()]);
+    write(root, "a.txt", "A\n");
+    client.commit("r2", "a").unwrap();
+    assert!(client.cat_revision_file("2", "secret.env").is_err());
+}
+
+#[test]
+fn revert_never_touches_unversioned_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "a\n");
+    add(&client, &["a.txt"]);
+    client.commit("r1", "a").unwrap();
+
+    write(root, "notes.txt", "my notes\n");
+    write(root, "a.txt", "changed\n");
+    write(root, "new.txt", "new\n");
+    add(&client, &["new.txt"]);
+    client.revert(&[]).unwrap();
+
+    assert_eq!(read(root, "a.txt"), "a\n");
+    assert_eq!(read(root, "notes.txt"), "my notes\n");
+    // A reverted addition stays on disk, just unversioned again.
+    assert_eq!(read(root, "new.txt"), "new\n");
+    assert!(client.status().unwrap().is_empty());
+    assert_eq!(
+        client.unversioned().unwrap(),
+        vec!["new.txt".to_owned(), "notes.txt".to_owned()]
+    );
+}
+
+#[test]
+fn rm_and_move_are_recorded_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "alpha\n");
+    write(root, "gone.txt", "bye\n");
+    add(&client, &["a.txt", "gone.txt"]);
+    client.commit("r1", "a").unwrap();
+
+    client.remove(&["gone.txt".to_owned()], false).unwrap();
+    assert!(!root.join("gone.txt").exists());
+    client.move_path("a.txt", "b.txt").unwrap();
+    let st = client.status().unwrap();
+    let moved = st.iter().find(|c| c.path == "b.txt").unwrap();
+    assert_eq!(moved.moved_from.as_deref(), Some("a.txt"));
+
+    let c2 = client.commit("r2", "a").unwrap();
+    let paths: Vec<&str> = c2.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["b.txt"]);
+    let b = c2.files.iter().find(|f| f.path == "b.txt").unwrap();
+    assert_eq!(b.copy_from_path.as_deref(), Some("a.txt"));
+}
+
+#[test]
+fn update_never_overwrites_an_unversioned_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "a\n");
+    add(&client, &["a.txt"]);
+    client.commit("r1", "a").unwrap();
+    write(root, "b.txt", "from r2\n");
+    add(&client, &["b.txt"]);
+    client.commit("r2", "a").unwrap();
+
+    client.update_to_revision("1").unwrap();
+    assert!(!root.join("b.txt").exists());
+    write(root, "b.txt", "my local file\n");
+    let outcome = client.update_to_revision("HEAD");
+    // The obstruction is reported, and the local file survives either way.
+    let _ = outcome;
+    assert_eq!(read(root, "b.txt"), "my local file\n");
+}
+
+#[test]
+fn narrowing_depth_keeps_local_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "top.txt", "t\n");
+    write(root, "sub/clean.txt", "c\n");
+    write(root, "sub/edited.txt", "e\n");
+    add(&client, &["top.txt", "sub"]);
+    client.commit("r1", "a").unwrap();
+
+    write(root, "sub/edited.txt", "local edit\n");
+    write(root, "sub/untracked.txt", "u\n");
+    client
+        .update_to_revision_with_depth("HEAD", Some(version_control_rs::Depth::Files))
+        .unwrap();
+
+    assert!(
+        !root.join("sub/clean.txt").exists(),
+        "unmodified file pruned"
+    );
+    assert_eq!(read(root, "sub/edited.txt"), "local edit\n");
+    assert_eq!(read(root, "sub/untracked.txt"), "u\n");
+    // Out-of-depth files are neither reported as deleted nor dropped by a commit.
+    assert!(client.status().unwrap().is_empty());
+    write(root, "top.txt", "T\n");
+    let c2 = client.commit("r2", "a").unwrap();
+    assert!(c2.files.iter().any(|f| f.path == "sub/clean.txt"));
 }
