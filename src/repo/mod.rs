@@ -48,6 +48,10 @@ pub struct TreeEdits {
     pub props: BTreeMap<String, BTreeMap<String, Option<String>>>,
     /// Paths to delete (ignored when the same path is also put).
     pub deletes: BTreeSet<String>,
+    /// Revision each edit was based on. A path changed in the repository
+    /// after its base revision makes the commit fail as out of date instead
+    /// of silently overwriting that change.
+    pub bases: BTreeMap<String, i64>,
 }
 
 /// Where the content of a commit comes from.
@@ -795,13 +799,30 @@ impl Repository {
     /// trace and the local working state never blocks remote commits.
     pub fn commit_edits(&self, edits: &TreeEdits, message: &str, author: &str) -> Result<Commit> {
         let _lock = self.lock()?;
-        let mut tree: BTreeMap<String, FileEntry> = self
-            .head_commit()?
+        let head = self.head_commit()?;
+        let head_rev = head.as_ref().map_or(0, |c| c.revision);
+        let mut tree: BTreeMap<String, FileEntry> = head
             .map(|c| c.files)
             .unwrap_or_default()
             .into_iter()
             .map(|f| (f.path.clone(), f))
             .collect();
+
+        // Out-of-date check per path, under the lock: the path must be the
+        // same at HEAD as at the revision the client edited.
+        for (path, &base_rev) in &edits.bases {
+            if base_rev == head_rev {
+                continue;
+            }
+            let at_base = if base_rev == 0 {
+                None
+            } else {
+                self.file_entry_at_revision(base_rev, path)?
+            };
+            if changed_entry(at_base.as_ref(), tree.get(path)) {
+                return Err(VcsError::OutOfDate { base_rev, head_rev });
+            }
+        }
 
         for path in &edits.deletes {
             crate::path::validate_rel_path(path)?;

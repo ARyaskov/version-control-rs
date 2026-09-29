@@ -51,6 +51,8 @@ struct TxnActivity {
     files: BTreeMap<String, Vec<u8>>,
     props: BTreeMap<String, BTreeMap<String, Option<String>>>,
     deletes: BTreeSet<String>,
+    /// Revision each touched path was based on (first touch wins).
+    bases: BTreeMap<String, i64>,
 }
 
 pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Result<()> {
@@ -231,7 +233,13 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default();
             let data = if ctype.contains("svndiff") {
-                let base = load_head_file_bytes(&state.repo_root, &rel).unwrap_or_default();
+                // The delta is relative to the client's base revision, not to
+                // whatever HEAD happens to be now.
+                let base_rev = *activity
+                    .bases
+                    .entry(rel.clone())
+                    .or_insert_with(|| request_base_rev(&req, youngest));
+                let base = load_file_bytes_at(&state.repo_root, &rel, base_rev).unwrap_or_default();
                 match apply_svndiff_stream(&base, &body, remaining) {
                     Ok(v) => v,
                     Err(err) => return svn_error_response(err),
@@ -244,6 +252,10 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
             }
             // A PUT supersedes a pending delete for the same path (SVN replace).
             activity.deletes.remove(&rel);
+            activity
+                .bases
+                .entry(rel.clone())
+                .or_insert_with(|| request_base_rev(&req, youngest));
             activity.files.insert(rel, data);
             HttpResponse::Created().finish()
         }
@@ -270,6 +282,10 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
             };
             // Setting properties supersedes a pending delete for the same path.
             activity.deletes.remove(&rel);
+            activity
+                .bases
+                .entry(rel.clone())
+                .or_insert_with(|| request_base_rev(&req, youngest));
             let entry = activity.props.entry(rel).or_default();
             for (k, v) in ops {
                 entry.insert(k, v);
@@ -345,6 +361,10 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
             // A delete supersedes any pending PUT/PROPPATCH for the same path.
             activity.files.remove(&rel);
             activity.props.remove(&rel);
+            activity
+                .bases
+                .entry(rel.clone())
+                .or_insert_with(|| request_base_rev(&req, youngest));
             activity.deletes.insert(rel);
             HttpResponse::NoContent().finish()
         }
@@ -458,6 +478,7 @@ fn apply_activity_commit(
         puts: activity.files,
         props: activity.props,
         deletes: activity.deletes,
+        bases: activity.bases,
     };
     Ok(repo.commit_edits(&edits, &message, &author)?.revision)
 }
@@ -836,9 +857,21 @@ fn parse_update_target_rev(xml: &[u8]) -> Option<i64> {
     min_rev
 }
 
-fn load_head_file_bytes(repo_root: &Path, rel: &str) -> Option<Vec<u8>> {
+fn load_file_bytes_at(repo_root: &Path, rel: &str, rev: i64) -> Option<Vec<u8>> {
     let client = Client::discover(repo_root).ok()?;
-    client.cat_revision_file("HEAD", rel).ok()
+    client.cat_revision_file(&rev.to_string(), rel).ok()
+}
+
+/// Base revision the client's change to a path is relative to: the
+/// `X-SVN-Version-Name` header when present, otherwise HEAD at the time of
+/// the request (so changes committed later are still detected at MERGE).
+fn request_base_rev(req: &HttpRequest, youngest: i64) -> i64 {
+    req.headers()
+        .get("X-SVN-Version-Name")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|rev| (0..=youngest).contains(rev))
+        .unwrap_or(youngest)
 }
 
 fn encode_varint(mut n: u64, out: &mut Vec<u8>) {
@@ -1491,6 +1524,37 @@ mod tests {
         let mut next = TxnActivity::default();
         next.deletes.insert("b.txt".to_owned());
         assert_eq!(apply_activity_commit(root, next, None, false).unwrap(), 3);
+    }
+
+    #[test]
+    fn stale_http_edits_are_rejected_instead_of_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let client = Client::init(root).unwrap();
+        fs::write(root.join("a.txt"), "v1\n").unwrap();
+        client.add(&["a.txt".to_owned()]).unwrap();
+        client.commit("r1", "local").unwrap();
+
+        // Bob commits r2 on top of r1.
+        let mut bob = TxnActivity::default();
+        bob.files.insert("a.txt".to_owned(), b"bob\n".to_vec());
+        bob.bases.insert("a.txt".to_owned(), 1);
+        assert_eq!(apply_activity_commit(root, bob, None, false).unwrap(), 2);
+
+        // Alice still edits the r1 version: her commit must not silently
+        // overwrite Bob's change.
+        let mut alice = TxnActivity::default();
+        alice.files.insert("a.txt".to_owned(), b"alice\n".to_vec());
+        alice.bases.insert("a.txt".to_owned(), 1);
+        let err = apply_activity_commit(root, alice, None, false).unwrap_err();
+        assert!(matches!(err, VcsError::OutOfDate { .. }), "{err}");
+        assert_eq!(client.cat_revision_file("HEAD", "a.txt").unwrap(), b"bob\n");
+
+        // Based on r2 it goes through.
+        let mut alice = TxnActivity::default();
+        alice.files.insert("a.txt".to_owned(), b"alice\n".to_vec());
+        alice.bases.insert("a.txt".to_owned(), 2);
+        assert_eq!(apply_activity_commit(root, alice, None, false).unwrap(), 3);
     }
 
     #[test]
