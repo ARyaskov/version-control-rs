@@ -38,6 +38,28 @@ pub struct MergeOutcome {
     pub conflicts: Vec<String>,
 }
 
+/// Changes applied directly to the repository HEAD (see
+/// [`Repository::commit_edits`]).
+#[derive(Debug, Clone, Default)]
+pub struct TreeEdits {
+    /// New content per path, in repository form (as sent by a client).
+    pub puts: BTreeMap<String, Vec<u8>>,
+    /// Property changes per path; `None` removes the property.
+    pub props: BTreeMap<String, BTreeMap<String, Option<String>>>,
+    /// Paths to delete (ignored when the same path is also put).
+    pub deletes: BTreeSet<String>,
+}
+
+/// Where the content of a commit comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitSource {
+    /// The working copy: it must be at HEAD; pending merges and scheduled
+    /// changes are consumed, BASE moves, local lock tokens are checked.
+    WorkingCopy,
+    /// Direct edits to the repository; the working copy is not involved.
+    Store,
+}
+
 /// Result of integrating a remote HEAD into the working copy.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PullOutcome {
@@ -580,7 +602,15 @@ impl Repository {
         let schedule = self.wcdb()?.schedule()?;
         let tree = self.working_commit_tree()?;
         let committed: Vec<String> = schedule.keys().cloned().collect();
-        self.commit_entries(tree, message, author, revprops, &schedule, &committed)
+        self.commit_entries(
+            tree,
+            message,
+            author,
+            revprops,
+            &schedule,
+            &committed,
+            CommitSource::WorkingCopy,
+        )
     }
 
     /// The tree a full commit records: the versioned working files plus BASE
@@ -614,15 +644,19 @@ impl Repository {
         mut revprops: BTreeMap<String, String>,
         schedule: &BTreeMap<String, Scheduled>,
         committed_schedule: &[String],
+        source: CommitSource,
     ) -> Result<Commit> {
         let wcdb = self.wcdb()?;
+        let from_wc = source == CommitSource::WorkingCopy;
 
-        let base_rev = wcdb.base_revision()?;
-        let head_rev = wcdb.head_revision()?;
-        // Recorded merges do not exempt a stale working copy: committing on
-        // top of an outdated BASE would silently discard newer revisions.
-        if base_rev != head_rev {
-            return Err(VcsError::OutOfDate { base_rev, head_rev });
+        if from_wc {
+            let base_rev = wcdb.base_revision()?;
+            let head_rev = wcdb.head_revision()?;
+            // Recorded merges do not exempt a stale working copy: committing
+            // on top of an outdated BASE would silently discard newer revisions.
+            if base_rev != head_rev {
+                return Err(VcsError::OutOfDate { base_rev, head_rev });
+            }
         }
 
         let parent = self.head_commit()?;
@@ -632,7 +666,11 @@ impl Repository {
         let parent_revision = parent.as_ref().map(|c| c.revision);
         // Consumed atomically with the revision itself (see record_commit), so
         // a failed or interrupted commit never loses recorded merges.
-        let pending_merges = wcdb.pending_merges()?;
+        let pending_merges = if from_wc {
+            wcdb.pending_merges()?
+        } else {
+            Vec::new()
+        };
 
         if changed.is_empty() && pending_merges.is_empty() {
             return Err(VcsError::NothingToCommit);
@@ -674,7 +712,10 @@ impl Repository {
             let Some(entry) = snapshot_map.get(ch.path.as_str()).copied() else {
                 continue;
             };
-            if has_svn_prop(&entry.props, "svn:needs-lock") && !wcdb.has_lock_token(&ch.path)? {
+            if from_wc
+                && has_svn_prop(&entry.props, "svn:needs-lock")
+                && !wcdb.has_lock_token(&ch.path)?
+            {
                 return Err(VcsError::NeedsLockRequired {
                     path: ch.path.clone(),
                 });
@@ -731,19 +772,97 @@ impl Repository {
         wcdb.record_commit(
             &RevisionRow::from_commit(&commit)?,
             &pending_merges,
-            next_rev,
+            from_wc.then_some(next_rev),
             committed_schedule,
         )?;
 
         // Working-copy node metadata is derived data: the commit is already
         // durable, and the next status/sync repairs it if this refresh fails.
-        let _ = self.sync_wcdb();
+        if from_wc {
+            let _ = self.sync_wcdb();
+        }
         // The revision is published: a failing post-commit hook must not turn
         // a successful commit into an error. Its output is kept for review.
         if let Err(err) = self.run_hook("post-commit", &[&next_rev.to_string(), &id]) {
             self.log_hook_failure(&err);
         }
         Ok(commit)
+    }
+
+    /// Commit `edits` on top of HEAD directly in the repository, the way the
+    /// HTTP server applies a remote client's changes. The working copy of this
+    /// repository is neither read nor modified, so a rejected commit leaves no
+    /// trace and the local working state never blocks remote commits.
+    pub fn commit_edits(&self, edits: &TreeEdits, message: &str, author: &str) -> Result<Commit> {
+        let _lock = self.lock()?;
+        let mut tree: BTreeMap<String, FileEntry> = self
+            .head_commit()?
+            .map(|c| c.files)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect();
+
+        for path in &edits.deletes {
+            crate::path::validate_rel_path(path)?;
+            if !edits.puts.contains_key(path) && tree.remove(path).is_none() {
+                return Err(VcsError::PathNotFound(path.clone()));
+            }
+        }
+        let mut contents: BTreeMap<&str, &[u8]> = BTreeMap::new();
+        for (path, content) in &edits.puts {
+            crate::path::validate_rel_path(path)?;
+            let blob_id = storage::write_blob(self, content)?;
+            let entry = tree.entry(path.clone()).or_insert_with(|| FileEntry {
+                path: path.clone(),
+                blob_id: String::new(),
+                executable: false,
+                is_binary: false,
+                props: BTreeMap::new(),
+                copy_from_path: None,
+                copy_from_rev: None,
+                node_id: None,
+                copy_id: None,
+                created_rev: None,
+            });
+            entry.blob_id = blob_id;
+            contents.insert(path, content);
+        }
+        for (path, changes) in &edits.props {
+            let entry = tree
+                .get_mut(path)
+                .ok_or_else(|| VcsError::PathNotFound(path.clone()))?;
+            for (name, value) in changes {
+                match value {
+                    Some(v) => entry.props.insert(name.clone(), v.clone()),
+                    None => entry.props.remove(name),
+                };
+            }
+        }
+        // Derived flags of every touched entry follow its final content/props.
+        for path in edits.puts.keys().chain(edits.props.keys()) {
+            if let Some(entry) = tree.get_mut(path) {
+                let detected = match contents.get(path.as_str()) {
+                    Some(bytes) => is_binary_content(bytes),
+                    None => is_binary_content(&self.read_blob(&entry.blob_id)?),
+                };
+                entry.is_binary = effective_is_binary(detected, &entry.props);
+                entry.executable = has_svn_prop(&entry.props, "svn:executable");
+            }
+        }
+
+        let mut revprops = BTreeMap::new();
+        revprops.insert("svn:author".to_owned(), author.to_owned());
+        revprops.insert("svn:log".to_owned(), message.to_owned());
+        self.commit_entries(
+            tree.into_values().collect(),
+            message,
+            author,
+            revprops,
+            &BTreeMap::new(),
+            &[],
+            CommitSource::Store,
+        )
     }
 
     /// Commit only a staged subset without touching the working copy.
@@ -796,7 +915,15 @@ impl Repository {
         let mut revprops = BTreeMap::new();
         revprops.insert("svn:author".to_owned(), author.to_owned());
         revprops.insert("svn:log".to_owned(), message.to_owned());
-        self.commit_entries(snapshot, message, author, revprops, &schedule, &committed)
+        self.commit_entries(
+            snapshot,
+            message,
+            author,
+            revprops,
+            &schedule,
+            &committed,
+            CommitSource::WorkingCopy,
+        )
     }
 
     pub fn log(&self, limit: usize) -> Result<Vec<Commit>> {

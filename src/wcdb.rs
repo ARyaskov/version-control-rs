@@ -752,14 +752,15 @@ impl WcDb {
         Ok(out)
     }
 
-    /// The commit point: publish revision `row`, record its merge edges,
-    /// consume the pending merges and move BASE — all in one transaction, so a
+    /// The commit point: publish revision `row`, record its merge edges and,
+    /// for working-copy commits, consume the pending merges and move BASE —
+    /// all in one transaction, so a
     /// crash leaves either the previous state or the complete new revision.
     pub fn record_commit(
         &self,
         row: &RevisionRow,
         merged: &[(String, i64)],
-        new_base: i64,
+        new_base: Option<i64>,
         committed_schedule: &[String],
     ) -> Result<()> {
         self.with_write_tx(|tx| {
@@ -773,8 +774,12 @@ impl WcDb {
                     params![row.rev, merged_rev, source_path],
                 )?;
             }
-            tx.execute("DELETE FROM pending_merges", [])?;
-            set_meta_tx(tx, "base_revision", &new_base.to_string())?;
+            // Only a working-copy commit moves BASE and consumes the merges
+            // recorded in the working copy.
+            if let Some(base) = new_base {
+                tx.execute("DELETE FROM pending_merges", [])?;
+                set_meta_tx(tx, "base_revision", &base.to_string())?;
+            }
             Ok(())
         })
     }

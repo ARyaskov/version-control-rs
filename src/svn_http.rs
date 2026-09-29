@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::client::Client;
 use crate::error::{Result, VcsError};
+use crate::repo::{Repository, TreeEdits};
 use crate::types::ChangedPathAction;
 
 /// Cap on concurrently open commit activities (abandoned MKACTIVITY sessions
@@ -434,46 +435,17 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
     }
 }
 
+/// Commit an activity directly into the repository (never through the
+/// server's working copy, which may be dirty or stale and must not be left
+/// modified by a rejected commit).
 fn apply_activity_commit(
     repo_root: &Path,
     activity: TxnActivity,
     log_message: Option<String>,
     hooks: bool,
 ) -> Result<i64> {
-    let client = Client::discover(repo_root)?.with_hooks(hooks);
-    if !client.status()?.is_empty() {
-        return Err(VcsError::WorkingCopyDirty);
-    }
-
-    for (rel, bytes) in &activity.files {
-        let abs = join_repo_path(repo_root, rel)?;
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(abs, bytes)?;
-    }
-    // New files must be put under version control explicitly.
-    let paths: Vec<String> = activity.files.keys().cloned().collect();
-    client.add(&paths)?;
-    for rel in &activity.deletes {
-        // A path re-added in the same activity must not be deleted.
-        if activity.files.contains_key(rel) {
-            continue;
-        }
-        match client.remove(std::slice::from_ref(rel), false) {
-            Ok(_) | Err(VcsError::NotVersioned(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    for (rel, props) in &activity.props {
-        for (name, value) in props {
-            match value {
-                Some(v) => client.set_property(rel, name, v)?,
-                None => client.del_property(rel, name)?,
-            }
-        }
-    }
-
+    let mut repo = Repository::discover(repo_root)?;
+    repo.set_hooks_enabled(hooks);
     let message = log_message
         .or(activity.log_message)
         .unwrap_or_else(|| "HTTP commit".to_owned());
@@ -482,8 +454,12 @@ fn apply_activity_commit(
     } else {
         activity.author
     };
-    let commit = client.commit(&message, &author)?;
-    Ok(commit.revision)
+    let edits = TreeEdits {
+        puts: activity.files,
+        props: activity.props,
+        deletes: activity.deletes,
+    };
+    Ok(repo.commit_edits(&edits, &message, &author)?.revision)
 }
 
 fn method_action(method: &str) -> Option<Action> {
@@ -648,10 +624,6 @@ fn load_locks(path: &Path) -> Result<BTreeMap<String, String>> {
 fn save_locks(path: &Path, locks: &BTreeMap<String, String>) -> Result<()> {
     fs::write(path, serde_json::to_vec_pretty(locks)?)?;
     Ok(())
-}
-
-fn join_repo_path(repo_root: &Path, rel: &str) -> Result<PathBuf> {
-    crate::path::safe_join(repo_root, rel)
 }
 
 fn sanitize_repo_rel(input: &str) -> Result<String> {
@@ -1455,10 +1427,10 @@ mod tests {
     #[test]
     fn join_repo_path_rejects_escaping_components() {
         let root = Path::new("/repo/root");
-        assert!(join_repo_path(root, "a/b.txt").is_ok());
-        assert!(join_repo_path(root, "../escape").is_err());
-        assert!(join_repo_path(root, "C:/Windows").is_err());
-        assert!(join_repo_path(root, "foo/C:/x").is_err());
+        assert!(crate::path::safe_join(root, "a/b.txt").is_ok());
+        assert!(crate::path::safe_join(root, "../escape").is_err());
+        assert!(crate::path::safe_join(root, "C:/Windows").is_err());
+        assert!(crate::path::safe_join(root, "foo/C:/x").is_err());
     }
 
     #[test]
@@ -1476,6 +1448,49 @@ mod tests {
             xml_escape(r#"a&b<c>d"e'f"#),
             "a&amp;b&lt;c&gt;d&quot;e&apos;f"
         );
+    }
+
+    #[test]
+    fn http_commit_bypasses_the_server_working_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let client = Client::init(root).unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        client.add(&["a.txt".to_owned()]).unwrap();
+        client.commit("r1", "local").unwrap();
+        // The server's own working copy is dirty.
+        fs::write(root.join("a.txt"), "local edit\n").unwrap();
+
+        let mut activity = TxnActivity {
+            author: "alice".to_owned(),
+            ..TxnActivity::default()
+        };
+        activity
+            .files
+            .insert("b.txt".to_owned(), b"remote\n".to_vec());
+        let rev = apply_activity_commit(root, activity, Some("remote".into()), false).unwrap();
+        assert_eq!(rev, 2);
+        assert!(
+            !root.join("b.txt").exists(),
+            "nothing written to the working copy"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "local edit\n"
+        );
+        assert_eq!(client.cat_revision_file("2", "b.txt").unwrap(), b"remote\n");
+        assert_eq!(client.cat_revision_file("2", "a.txt").unwrap(), b"a\n");
+
+        // A rejected commit leaves no trace and later commits still work.
+        let mut bad = TxnActivity::default();
+        bad.props.insert(
+            "missing.txt".to_owned(),
+            BTreeMap::from([("x".to_owned(), Some("1".to_owned()))]),
+        );
+        assert!(apply_activity_commit(root, bad, None, false).is_err());
+        let mut next = TxnActivity::default();
+        next.deletes.insert("b.txt".to_owned());
+        assert_eq!(apply_activity_commit(root, next, None, false).unwrap(), 3);
     }
 
     #[test]
