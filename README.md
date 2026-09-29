@@ -111,6 +111,14 @@ history explicitly, `rm` schedules a deletion, and deleting a versioned file
 from disk is committed as a deletion. `revert` restores versioned files to
 BASE and un-schedules additions (the files stay on disk, unversioned).
 
+Ignore rules come from `vcrs ignore add <glob>` and a `.vcrsignore` file (one
+glob per line, `#` comments). Nothing is ignored by convention — add build
+directories yourself (e.g. `target/**`, `node_modules`). Ignored directories are
+not descended into.
+
+`status` keeps a stat cache (size, mtime, normalization settings) in `wc.db`
+and only re-reads files whose metadata changed.
+
 ### Staging workflow
 
 `vcrs` supports an explicit staging area stored in `.vcrs/client-stage-index.json`.

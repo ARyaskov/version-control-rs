@@ -119,6 +119,14 @@ pub fn write_object(repo: &Repository, bytes: &[u8]) -> Result<String> {
     Ok(id)
 }
 
+pub fn object_exists(repo: &Repository, id: &str) -> bool {
+    if validate_object_id(id).is_err() {
+        return false;
+    }
+    let (compressed, legacy) = object_paths(repo, id);
+    compressed.exists() || legacy.exists()
+}
+
 /// Read an object and verify that its content still hashes to its id.
 pub fn read_object(repo: &Repository, id: &str) -> Result<Vec<u8>> {
     validate_object_id(id)?;

@@ -9,7 +9,7 @@ use crate::types::{Commit, FileChange, FileEntry};
 
 /// Bump when the schema below changes so existing working copies re-run the
 /// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug)]
 pub struct WcDb {
@@ -29,6 +29,27 @@ pub enum ScheduleOp {
 pub struct Scheduled {
     pub op: ScheduleOp,
     pub copy_from: Option<String>,
+}
+
+/// What a working file hashed to, and the stat data it had at the time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatEntry {
+    pub size: i64,
+    pub mtime_ns: i64,
+    /// Fingerprint of everything besides the content that normalization
+    /// depends on (properties, symlink, executable bit).
+    pub props_key: String,
+    pub blob_id: String,
+    pub is_binary: bool,
+}
+
+impl StatEntry {
+    /// Same file metadata and normalization inputs as `other`.
+    pub fn same_stamp(&self, other: &StatEntry) -> bool {
+        self.size == other.size
+            && self.mtime_ns == other.mtime_ns
+            && self.props_key == other.props_key
+    }
 }
 
 /// A repository-level (svn) lock on a path, held by `owner`.
@@ -234,6 +255,15 @@ impl WcDb {
             -- Before 0.3, merge --record-only also queued its revision here and
             -- the queue re-added it with scope "/" on the next run.
             DELETE FROM work_queue;
+
+            CREATE TABLE IF NOT EXISTS stat_cache (
+                path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                props_key TEXT NOT NULL,
+                blob_id TEXT NOT NULL,
+                is_binary INTEGER NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS repo_locks (
                 path TEXT PRIMARY KEY,
@@ -541,6 +571,58 @@ impl WcDb {
         self.with_write_tx(|tx| {
             for path in paths.iter().filter(|p| !keep.contains(*p)) {
                 tx.execute("DELETE FROM file_props WHERE path=?1", params![path])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn stat_cache(&self) -> Result<BTreeMap<String, StatEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size, mtime_ns, props_key, blob_id, is_binary FROM stat_cache",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StatEntry {
+                    size: r.get(1)?,
+                    mtime_ns: r.get(2)?,
+                    props_key: r.get(3)?,
+                    blob_id: r.get(4)?,
+                    is_binary: r.get::<_, i64>(5)? != 0,
+                },
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (path, entry) = row?;
+            out.insert(path, entry);
+        }
+        Ok(out)
+    }
+
+    pub fn update_stat_cache(&self, entries: &[(String, StatEntry)]) -> Result<()> {
+        self.with_write_tx(|tx| {
+            for (path, e) in entries {
+                tx.execute(
+                    "INSERT OR REPLACE INTO stat_cache(path, size, mtime_ns, props_key, blob_id, is_binary)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![path, e.size, e.mtime_ns, e.props_key, e.blob_id, e.is_binary as i64],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Drop stat-cache rows of paths not in `keep`.
+    pub fn retain_stat_cache(&self, keep: &std::collections::BTreeSet<String>) -> Result<()> {
+        let paths: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT path FROM stat_cache")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        self.with_write_tx(|tx| {
+            for path in paths.iter().filter(|p| !keep.contains(*p)) {
+                tx.execute("DELETE FROM stat_cache WHERE path=?1", params![path])?;
             }
             Ok(())
         })

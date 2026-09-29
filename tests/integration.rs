@@ -1103,3 +1103,54 @@ fn malformed_ids_are_errors_not_panics() {
         assert!(repo.read_commit(id).is_err(), "{id:?}");
     }
 }
+
+fn set_mtime(path: &Path, when: std::time::SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn stat_cache_avoids_rehashing_unchanged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "aaaa\n");
+    add(&client, &["a.txt"]);
+    client.commit("r1", "a").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    set_mtime(&root.join("a.txt"), old);
+    assert!(client.status().unwrap().is_empty()); // hashes once, caches
+
+    // Same size and mtime: the cached hash is trusted (the file is not read).
+    write(root, "a.txt", "bbbb\n");
+    set_mtime(&root.join("a.txt"), old);
+    assert!(client.status().unwrap().is_empty());
+
+    // A real modification changes the mtime and is detected.
+    write(root, "a.txt", "cccc\n");
+    assert_eq!(client.status().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn ignored_directories_are_not_descended() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    client.add_ignore("node_modules").unwrap();
+    write(root, "node_modules/pkg/index.js", "x\n");
+    write(root, "target/out.txt", "build output\n");
+    let locked = root.join("node_modules/pkg");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Walking into the unreadable ignored directory would fail.
+    let unversioned = client.unversioned();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    // `target` is not special without an ignore rule.
+    assert_eq!(unversioned.unwrap(), vec!["target/out.txt".to_owned()]);
+}

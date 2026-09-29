@@ -21,7 +21,7 @@ use crate::types::{
     RevisionRange,
 };
 use crate::wcdb::{
-    ConflictRecord, ExternalDef, PathLock, RevisionRow, ScheduleOp, Scheduled, WcDb,
+    ConflictRecord, ExternalDef, PathLock, RevisionRow, ScheduleOp, Scheduled, StatEntry, WcDb,
 };
 
 pub(crate) const VCRS_DIR: &str = ".vcrs";
@@ -336,6 +336,13 @@ impl Repository {
         let all_file_props = wcdb.all_file_props()?;
         let all_inherited = wcdb.all_inherited_props()?;
         let empty_props = BTreeMap::new();
+        // Files whose size, mtime and normalization-relevant properties are
+        // unchanged since they were last hashed are not read again. Files
+        // modified within the last seconds are not cached (their mtime could
+        // still change without a visible difference: "racily clean").
+        let cache = wcdb.stat_cache()?;
+        let racy_cutoff = std::time::SystemTime::now() - RACY_WINDOW;
+        let mut fresh = Vec::new();
 
         let mut entries = Vec::new();
         for rel in versioned_paths(&base, &schedule) {
@@ -357,13 +364,6 @@ impl Repository {
             }
 
             let is_symlink = md.file_type().is_symlink();
-            let raw = if is_symlink {
-                let target = fs::read_link(&abs)?;
-                format!("link {}", target.to_string_lossy()).into_bytes()
-            } else {
-                fs::read(&abs)?
-            };
-
             // A symlink is marked by svn:special; the exec bit on the link
             // itself (conventionally 0o777) is meaningless, so never infer it.
             #[cfg(unix)]
@@ -376,9 +376,56 @@ impl Repository {
 
             let file_props = all_file_props.get(&rel).unwrap_or(&empty_props);
             let inherited = resolve_inherited(&rel, &all_inherited);
-            entries.push(self.finalize_entry(
+            let stamp = StatEntry {
+                size: md.len() as i64,
+                mtime_ns: mtime_ns(&md),
+                props_key: props_fingerprint(file_props, &inherited, is_symlink, executable),
+                blob_id: String::new(),
+                is_binary: false,
+            };
+            if let Some(hit) = cache.get(&rel)
+                && hit.same_stamp(&stamp)
+                && (!persist || storage::object_exists(self, &hit.blob_id))
+            {
+                let props = node_props(file_props, is_symlink, executable);
+                entries.push(FileEntry {
+                    path: rel,
+                    blob_id: hit.blob_id.clone(),
+                    executable: has_svn_prop(&props, "svn:executable"),
+                    is_binary: hit.is_binary,
+                    props,
+                    copy_from_path: None,
+                    copy_from_rev: None,
+                    node_id: None,
+                    copy_id: None,
+                    created_rev: None,
+                });
+                continue;
+            }
+
+            let raw = if is_symlink {
+                let target = fs::read_link(&abs)?;
+                format!("link {}", target.to_string_lossy()).into_bytes()
+            } else {
+                fs::read(&abs)?
+            };
+            let entry = self.finalize_entry(
                 &rel, raw, is_symlink, executable, file_props, &inherited, persist,
-            )?);
+            )?;
+            if md.modified().is_ok_and(|m| m < racy_cutoff) {
+                fresh.push((
+                    rel,
+                    StatEntry {
+                        blob_id: entry.blob_id.clone(),
+                        is_binary: entry.is_binary,
+                        ..stamp
+                    },
+                ));
+            }
+            entries.push(entry);
+        }
+        if !fresh.is_empty() {
+            wcdb.update_stat_cache(&fresh)?;
         }
         Ok(entries)
     }
@@ -390,7 +437,7 @@ impl Repository {
         let ignore = build_ignore_globset(&self.collect_ignore_patterns(&wcdb)?);
         let scope = WcScope::load(&wcdb)?;
         Ok(self
-            .walk_files(&self.root)?
+            .walk_files(&self.root, Some(&ignore))?
             .into_iter()
             .filter(|rel| {
                 !versioned.contains(rel)
@@ -401,13 +448,26 @@ impl Repository {
     }
 
     /// Every file or symlink below `dir` with a representable repository
-    /// path, sorted; metadata directories are pruned.
-    fn walk_files(&self, dir: &Path) -> Result<Vec<String>> {
+    /// path, sorted. Metadata directories are pruned, and so are directories
+    /// matched by `ignore` (other than `dir` itself): an ignored
+    /// `node_modules` is never descended into.
+    fn walk_files(&self, dir: &Path, ignore: Option<&GlobSet>) -> Result<Vec<String>> {
         let root = self.root.clone();
+        let start = dir.to_path_buf();
         let walker = WalkDir::new(dir)
             .follow_links(false)
             .into_iter()
-            .filter_entry(move |e| !is_excluded_path(e.path(), &root));
+            .filter_entry(move |e| {
+                if is_excluded_path(e.path(), &root) {
+                    return false;
+                }
+                match ignore {
+                    Some(ignore) if e.file_type().is_dir() && e.path() != start => {
+                        rel_from_fs(&root, e.path()).is_none_or(|rel| !is_ignored_dir(ignore, &rel))
+                    }
+                    _ => true,
+                }
+            });
         let mut out = Vec::new();
         for entry in walker {
             let entry = entry?;
@@ -463,7 +523,7 @@ impl Repository {
             let md =
                 fs::symlink_metadata(&abs).map_err(|_| VcsError::PathNotFound(path.clone()))?;
             let candidates = if md.is_dir() {
-                self.walk_files(&abs)?
+                self.walk_files(&abs, Some(&ignore))?
                     .into_iter()
                     .filter(|rel| !ignore.is_match(rel))
                     .collect()
@@ -2507,16 +2567,16 @@ impl Repository {
         wcdb.replace_nodes(&base_files, working, &changes)?;
         // Explicit properties are owned by prop-set/update/revert; only drop
         // the ones of paths that left version control.
-        wcdb.retain_file_props(&versioned_paths(&self.base_files(&wcdb)?, &schedule))?;
+        let versioned = versioned_paths(&self.base_files(&wcdb)?, &schedule);
+        wcdb.retain_file_props(&versioned)?;
+        wcdb.retain_stat_cache(&versioned)?;
         Ok(changes)
     }
 
     fn collect_ignore_patterns(&self, wcdb: &WcDb) -> Result<Vec<String>> {
-        let mut patterns = vec![
-            ".vcrs/**".to_owned(),
-            ".git/**".to_owned(),
-            "target/**".to_owned(),
-        ];
+        // Metadata directories are pruned structurally; everything else is
+        // configuration (no built-in "target" or other project conventions).
+        let mut patterns = Vec::new();
 
         for (_scope, p, _inherited) in wcdb.list_ignore_rules()? {
             patterns.push(p);
@@ -2939,16 +2999,50 @@ fn is_excluded_path(path: &Path, root: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(root) else {
         return false;
     };
-    let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) else {
+    if rel.as_os_str().is_empty() {
         return false;
-    };
-    // Metadata directories are pruned at any depth (nested checkouts); the
-    // build directory only at the top level.
+    }
+    // Metadata directories are pruned at any depth (nested checkouts).
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    is_reserved_component(name) || first == "target"
+    is_reserved_component(name)
+}
+
+/// A directory is ignored when a pattern matches it or would match every
+/// file inside it (`build/**`, `**/node_modules/**`, `tmp/*`).
+fn is_ignored_dir(ignore: &GlobSet, rel: &str) -> bool {
+    ignore.is_match(rel) || ignore.is_match(format!("{rel}/{IGNORE_PROBE}"))
+}
+
+/// A file name no ignore pattern plausibly targets on its own, used to ask
+/// whether a pattern covers a whole directory.
+const IGNORE_PROBE: &str = "\u{1}vcrs-probe";
+
+/// Files modified this recently are re-hashed instead of trusting the stat
+/// cache (timestamp granularity could hide a same-size rewrite).
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn mtime_ns(md: &fs::Metadata) -> i64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as i64)
+}
+
+/// Everything normalization of a file depends on besides its content.
+fn props_fingerprint(
+    file_props: &BTreeMap<String, String>,
+    inherited: &BTreeMap<String, String>,
+    is_symlink: bool,
+    executable: bool,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(
+        &serde_json::to_vec(&(file_props, inherited, is_symlink, executable)).unwrap_or_default(),
+    );
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Resolve inherited properties for `path` from the pre-loaded scope map,
@@ -2999,19 +3093,7 @@ fn repo_form(
     executable: bool,
 ) -> (Vec<u8>, BTreeMap<String, String>, bool) {
     let detected_binary = is_binary_content(&raw);
-    let mut props = file_props.clone();
-    if cfg!(unix) {
-        if executable {
-            props.insert("svn:executable".to_owned(), "*".to_owned());
-        } else {
-            props.remove("svn:executable");
-        }
-    }
-    if is_symlink {
-        props.insert("svn:special".to_owned(), "*".to_owned());
-    } else if cfg!(unix) {
-        props.remove("svn:special");
-    }
+    let props = node_props(file_props, is_symlink, executable);
     let effective = with_inherited(&props, inherited);
     let is_binary = effective_is_binary(detected_binary, &effective);
     // Only normalize line endings when svn:eol-style is set; without it,
@@ -3030,6 +3112,30 @@ fn repo_form(
         raw = contract_keywords(text, &effective).into_bytes();
     }
     (raw, props, is_binary)
+}
+
+/// Node properties of a working file: the explicit ones, with `svn:executable`
+/// and `svn:special` mirroring the file itself where the filesystem can
+/// express them (see [`repo_form`]).
+fn node_props(
+    file_props: &BTreeMap<String, String>,
+    is_symlink: bool,
+    executable: bool,
+) -> BTreeMap<String, String> {
+    let mut props = file_props.clone();
+    if cfg!(unix) {
+        if executable {
+            props.insert("svn:executable".to_owned(), "*".to_owned());
+        } else {
+            props.remove("svn:executable");
+        }
+    }
+    if is_symlink {
+        props.insert("svn:special".to_owned(), "*".to_owned());
+    } else if cfg!(unix) {
+        props.remove("svn:special");
+    }
+    props
 }
 
 /// Node properties overlaid with inherited ones (node properties win).
