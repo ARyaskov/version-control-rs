@@ -92,9 +92,12 @@ pub enum ResolveAccept {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct GcStats {
+    /// Objects (contents and trees) removed.
     pub removed: usize,
     pub kept: usize,
     pub bytes_freed: u64,
+    /// Commit objects that were not part of the history.
+    pub commits_removed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,9 +203,18 @@ impl Repository {
         self.read_commit(&commit_id)
     }
 
+    /// The entry of `path` at revision `rev`, reading only the trees along
+    /// the path (not the whole revision).
     pub fn file_entry_at_revision(&self, rev: i64, path: &str) -> Result<Option<FileEntry>> {
-        let commit = self.read_commit_by_revision(rev)?;
-        Ok(commit.files.into_iter().find(|f| f.path == path))
+        let commit_id = self
+            .wcdb()?
+            .commit_for_revision(rev)?
+            .ok_or_else(|| VcsError::RevisionNotFound(rev.to_string()))?;
+        let commit = storage::read_commit_header(self, &commit_id)?;
+        match &commit.tree {
+            Some(tree) => storage::tree_lookup(self, tree, path),
+            None => Ok(commit.files.into_iter().find(|f| f.path == path)),
+        }
     }
 
     /// Re-derive the revision index from the current HEAD's parent chain.
@@ -217,28 +229,46 @@ impl Repository {
         storage::write_blob(self, content)
     }
 
-    /// Sweep blobs in the object store that no commit references. Runs under
-    /// the repository lock, so no commit can be in progress.
+    /// Remove commit objects that are not part of the history (interrupted or
+    /// rejected commits, commits superseded by a pull that replayed them) and
+    /// every object no remaining commit references. Runs under the repository
+    /// lock, so no commit can be in progress.
     pub fn gc(&self) -> Result<GcStats> {
         let _lock = self.lock()?;
-        let commits_dir = self.root.join(VCRS_DIR).join("commits");
-        let mut referenced: BTreeSet<String> = BTreeSet::new();
+        let mut stats = GcStats::default();
+        let history: BTreeSet<String> = self
+            .chain_ids(self.head_commit_id()?.as_deref())?
+            .into_iter()
+            .collect();
+
+        let mut live: BTreeSet<String> = BTreeSet::new();
+        for id in &history {
+            let commit = storage::read_commit_header(self, id)?;
+            match &commit.tree {
+                Some(tree) => storage::collect_tree_objects(self, tree, &mut live)?,
+                None => live.extend(commit.files.iter().map(|f| f.blob_id.clone())),
+            }
+        }
+
+        let commits_dir = storage::commits_dir(self);
         if commits_dir.exists() {
             for entry in fs::read_dir(&commits_dir)? {
-                let entry = entry?;
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                let path = entry?.path();
+                let Some(id) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_suffix(".json"))
+                else {
                     continue;
-                }
-                let commit = storage::parse_commit(&fs::read(&p)?)?;
-                for f in &commit.files {
-                    referenced.insert(f.blob_id.clone());
+                };
+                if !history.contains(id) {
+                    fs::remove_file(&path)?;
+                    stats.commits_removed += 1;
                 }
             }
         }
 
-        let objects_dir = self.root.join(VCRS_DIR).join("objects");
-        let mut stats = GcStats::default();
+        let objects_dir = storage::objects_dir(self);
         if !objects_dir.exists() {
             return Ok(stats);
         }
@@ -251,24 +281,24 @@ impl Repository {
                 continue;
             };
             let prefix = prefix.to_owned();
-            for blob_entry in fs::read_dir(&prefix_path)? {
-                let bp = blob_entry?.path();
-                if !bp.is_file() {
+            for object_entry in fs::read_dir(&prefix_path)? {
+                let op = object_entry?.path();
+                if !op.is_file() {
                     continue;
                 }
-                let Some(rest) = bp.file_name().and_then(|n| n.to_str()) else {
+                // Skips our own atomic-write temp files.
+                let Some(id) = op
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| storage::object_id_from_file(&prefix, n))
+                else {
                     continue;
                 };
-                // Skip our own atomic-write temp files.
-                if rest.ends_with(".tmp") {
-                    continue;
-                }
-                let hash = format!("{prefix}{rest}");
-                if referenced.contains(&hash) {
+                if live.contains(&id) {
                     stats.kept += 1;
                 } else {
-                    let size = fs::metadata(&bp).map(|m| m.len()).unwrap_or(0);
-                    fs::remove_file(&bp)?;
+                    let size = fs::metadata(&op).map(|m| m.len()).unwrap_or(0);
+                    fs::remove_file(&op)?;
                     stats.removed += 1;
                     stats.bytes_freed += size;
                 }
@@ -780,6 +810,7 @@ impl Repository {
             mergeinfo,
             revprops,
             txn_id: None,
+            tree: None,
             changed_paths,
         };
 
@@ -2028,6 +2059,7 @@ impl Repository {
             mergeinfo,
             revprops: commit.revprops.clone(),
             txn_id: None,
+            tree: None,
         };
         storage::write_commit(self, &rebased)?;
         Ok(rebased)

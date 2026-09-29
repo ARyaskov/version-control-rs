@@ -34,6 +34,12 @@ pub struct Commit {
     pub author: String,
     pub message: String,
     pub created_at: DateTime<Utc>,
+    /// Root tree object of this revision. Commit files written since 0.3
+    /// store the tree instead of `files`; readers expand it into `files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// Every file of the revision (expanded from `tree` when read).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
     pub changed_files: Vec<FileChange>,
     #[serde(default)]

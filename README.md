@@ -186,11 +186,20 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
 ## Architecture notes
 
 - Repository metadata is stored in `.vcrs/`
-- Content-addressed blobs (`blake3`) are stored under `.vcrs/objects/`
-- Commits are JSON documents under `.vcrs/commits/`
-- SQLite WC database: `.vcrs/wc.db`
-- Numeric revisions are tracked in WC DB (`revisions` table) and linked to commit IDs.
-
+- Objects are content-addressed by `blake3` and stored zstd-compressed under
+  `.vcrs/objects/` (`<2 hex>/<62 hex>.z`): file contents and directory trees.
+  Each tree lists one directory level, so unchanged subtrees are shared
+  between revisions.
+- Commits are JSON documents under `.vcrs/commits/` that reference their root
+  tree (a commit's size is proportional to what it changed, not to the size of
+  the repository).
+- SQLite WC database: `.vcrs/wc.db` — revision index (the source of truth for
+  HEAD), BASE, scheduled additions/deletions, conflicts, properties, locks.
+- Every mutating operation holds an exclusive lock on `.vcrs/lock`; a commit
+  becomes visible in a single SQLite transaction after its objects are durable.
+- `vcrs gc` removes objects and commit files that are not part of the history.
+- Repositories written by 0.2 (uncompressed objects, full manifests in
+  commits, `HEAD` file) are read and migrated transparently.
 
 ## License 
 

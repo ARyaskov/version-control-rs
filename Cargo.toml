@@ -45,6 +45,7 @@ thiserror = "2.0"
 uuid = { version = "1.10", features = ["v4"], optional = true }
 walkdir = "2.5"
 similar = "2.6"
+zstd = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 diffy = "0.4"
 globset = "0.4"

@@ -1018,3 +1018,44 @@ fn legacy_json_locks_are_imported() {
     assert_eq!(repo.path_locks().unwrap()["a.txt"].owner, "alice");
     assert!(!root.join(".vcrs/locks.json").exists());
 }
+
+#[test]
+fn commits_store_a_tree_not_a_manifest_and_gc_drops_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    for i in 0..20 {
+        write(root, &format!("dir/f{i}.txt"), &format!("{i}\n"));
+    }
+    add(&client, &["dir"]);
+    client.commit("r1", "a").unwrap();
+    write(root, "dir/f3.txt", "changed\n");
+    let c2 = client.commit("r2", "a").unwrap();
+    assert_eq!(c2.files.len(), 20, "readers still get the full file list");
+
+    let raw = read(root, &format!(".vcrs/commits/{}.json", c2.id));
+    assert!(raw.contains("\"tree\""), "{raw}");
+    assert!(!raw.contains("\"files\""), "no per-commit manifest: {raw}");
+    assert!(
+        raw.len() < 2000,
+        "commit size is O(changes): {} bytes",
+        raw.len()
+    );
+
+    // An orphan commit object (e.g. from an interrupted commit) is collected.
+    let mut orphan = c2.clone();
+    orphan.id = "e".repeat(64);
+    fs::write(
+        root.join(".vcrs/commits")
+            .join(format!("{}.json", orphan.id)),
+        serde_json::to_vec(&orphan).unwrap(),
+    )
+    .unwrap();
+    let stats = client.gc().unwrap();
+    assert_eq!(stats.commits_removed, 1);
+    assert_eq!(client.cat_revision_file("1", "dir/f3.txt").unwrap(), b"3\n");
+    assert_eq!(
+        client.cat_revision_file("2", "dir/f3.txt").unwrap(),
+        b"changed\n"
+    );
+}
