@@ -1059,3 +1059,47 @@ fn commits_store_a_tree_not_a_manifest_and_gc_drops_orphans() {
         b"changed\n"
     );
 }
+
+#[test]
+fn tampered_commits_and_objects_are_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "original\n");
+    add(&client, &["a.txt"]);
+    let c1 = client.commit("honest message", "alice").unwrap();
+
+    // Rewrite the author of the stored commit.
+    let commit_file = root.join(".vcrs/commits").join(format!("{}.json", c1.id));
+    let original = fs::read_to_string(&commit_file).unwrap();
+    fs::write(&commit_file, original.replace("\"alice\"", "\"mallory\"")).unwrap();
+    let err = client.log(10).unwrap_err();
+    assert!(
+        matches!(err, version_control_rs::VcsError::CorruptObject(_)),
+        "{err}"
+    );
+    fs::write(&commit_file, &original).unwrap();
+
+    // Replace the stored content of a.txt with other (valid) data.
+    let blob = &c1.files[0].blob_id;
+    let object = root
+        .join(".vcrs/objects")
+        .join(&blob[..2])
+        .join(format!("{}.z", &blob[2..]));
+    fs::write(&object, zstd::bulk::compress(b"forged\n", 3).unwrap()).unwrap();
+    let err = client.cat_revision_file("1", "a.txt").unwrap_err();
+    assert!(
+        matches!(err, version_control_rs::VcsError::CorruptObject(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn malformed_ids_are_errors_not_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    for id in ["", "a", "../../etc/passwd", &"G".repeat(64)] {
+        assert!(repo.read_blob(id).is_err(), "{id:?}");
+        assert!(repo.read_commit(id).is_err(), "{id:?}");
+    }
+}

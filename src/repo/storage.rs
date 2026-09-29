@@ -88,9 +88,9 @@ pub fn ensure_layout(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
-/// `(compressed, legacy raw)` locations of an object.
+/// `(compressed, legacy raw)` locations of an object (`id` must be valid).
 fn object_paths(repo: &Repository, id: &str) -> (PathBuf, PathBuf) {
-    let (prefix, rest) = id.split_at(2.min(id.len()));
+    let (prefix, rest) = id.split_at(2);
     let dir = objects_dir(repo).join(prefix);
     (dir.join(format!("{rest}.z")), dir.join(rest))
 }
@@ -119,15 +119,22 @@ pub fn write_object(repo: &Repository, bytes: &[u8]) -> Result<String> {
     Ok(id)
 }
 
+/// Read an object and verify that its content still hashes to its id.
 pub fn read_object(repo: &Repository, id: &str) -> Result<Vec<u8>> {
+    validate_object_id(id)?;
     let (compressed, legacy) = object_paths(repo, id);
-    if compressed.exists() {
-        return Ok(zstd::stream::decode_all(fs::File::open(compressed)?)?);
+    let bytes = if compressed.exists() {
+        zstd::stream::decode_all(fs::File::open(compressed)?)
+            .map_err(|_| VcsError::CorruptObject(id.to_owned()))?
+    } else if legacy.exists() {
+        fs::read(legacy)?
+    } else {
+        return Err(VcsError::BlobNotFound(id.to_owned()));
+    };
+    if hash_blob(&bytes) != id {
+        return Err(VcsError::CorruptObject(id.to_owned()));
     }
-    if legacy.exists() {
-        return Ok(fs::read(legacy)?);
-    }
-    Err(VcsError::BlobNotFound(id.to_owned()))
+    Ok(bytes)
 }
 
 pub fn write_blob(repo: &Repository, content: &[u8]) -> Result<String> {
@@ -326,7 +333,7 @@ pub fn write_commit(repo: &Repository, commit: &Commit) -> Result<()> {
         record.tree = Some(write_tree(repo, &commit.files)?);
     }
     record.files.clear();
-    let path = commit_path(repo, &commit.id);
+    let path = commit_path(repo, &commit.id)?;
     atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
     Ok(())
 }
@@ -334,7 +341,7 @@ pub fn write_commit(repo: &Repository, commit: &Commit) -> Result<()> {
 /// Remove a commit object that was never published (e.g. rejected by the
 /// pre-commit hook).
 pub fn delete_commit(repo: &Repository, id: &str) -> Result<()> {
-    let path = commit_path(repo, id);
+    let path = commit_path(repo, id)?;
     if path.exists() {
         fs::remove_file(path)?;
     }
@@ -354,11 +361,19 @@ pub fn read_commit(repo: &Repository, id: &str) -> Result<Commit> {
 /// Read a commit without expanding its tree (`files` stays empty for
 /// tree-based commits): cheap enough for walking history.
 pub fn read_commit_header(repo: &Repository, id: &str) -> Result<Commit> {
-    let path = commit_path(repo, id);
+    let path = commit_path(repo, id)?;
     if !path.exists() {
         return Err(VcsError::CommitNotFound(id.to_owned()));
     }
-    parse_commit(&fs::read(path)?)
+    let commit = parse_commit(&fs::read(path)?)?;
+    // The file must hold the commit it is named after, and (for verifiable
+    // formats) that commit must still hash to its id.
+    if commit.id != id
+        || (commit.format >= COMMIT_FORMAT && compute_commit_id(&commit)? != commit.id)
+    {
+        return Err(VcsError::CorruptObject(id.to_owned()));
+    }
+    Ok(commit)
 }
 
 /// Deserialize a commit file and reject any path that could escape the
@@ -367,6 +382,13 @@ pub fn read_commit_header(repo: &Repository, id: &str) -> Result<Commit> {
 /// when trees are read).
 pub fn parse_commit(bytes: &[u8]) -> Result<Commit> {
     let commit: Commit = serde_json::from_slice(bytes)?;
+    validate_object_id(&commit.id)?;
+    for id in [&commit.parent, &commit.tree].into_iter().flatten() {
+        validate_object_id(id)?;
+    }
+    for f in &commit.files {
+        validate_object_id(&f.blob_id)?;
+    }
     validate_commit_paths(&commit)?;
     Ok(commit)
 }
@@ -396,25 +418,39 @@ fn validate_commit_paths(commit: &Commit) -> Result<()> {
     Ok(())
 }
 
-pub fn new_commit_id(
-    parent: Option<&str>,
-    message: &str,
-    author: &str,
-    files: &[FileEntry],
-) -> String {
+/// Current commit record format (see [`Commit::format`]).
+pub const COMMIT_FORMAT: u32 = 2;
+
+/// Id of a commit: blake3 over a domain tag and the canonical JSON of the
+/// record without its id and expanded file list — i.e. over the root tree
+/// and every metadata field. Tampering with a stored commit changes it.
+pub fn compute_commit_id(commit: &Commit) -> Result<String> {
+    let mut record = commit.clone();
+    record.id.clear();
+    record.files.clear();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(parent.unwrap_or_default().as_bytes());
-    hasher.update(message.as_bytes());
-    hasher.update(author.as_bytes());
-    for file in files {
-        hasher.update(file.path.as_bytes());
-        hasher.update(file.blob_id.as_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
+    hasher.update(b"vcrs-commit-v2\0");
+    hasher.update(&serde_json::to_vec(&record)?);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn commit_path(repo: &Repository, id: &str) -> PathBuf {
-    commits_dir(repo).join(format!("{id}.json"))
+/// Object and commit ids are 64 lowercase hex digits. Checked before an id
+/// is turned into a path (ids come from commit files, HEAD and remotes).
+pub fn validate_object_id(id: &str) -> Result<()> {
+    if id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(())
+    } else {
+        Err(VcsError::InvalidObjectId(id.to_owned()))
+    }
+}
+
+fn commit_path(repo: &Repository, id: &str) -> Result<PathBuf> {
+    validate_object_id(id)?;
+    Ok(commits_dir(repo).join(format!("{id}.json")))
 }
 
 #[cfg(test)]

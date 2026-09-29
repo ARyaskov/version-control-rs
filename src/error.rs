@@ -8,6 +8,10 @@ pub enum VcsError {
     CommitNotFound(String),
     #[error("blob '{0}' was not found in the object store")]
     BlobNotFound(String),
+    #[error("object '{0}' is corrupt: its content does not match its id")]
+    CorruptObject(String),
+    #[error("invalid object id '{0}'")]
+    InvalidObjectId(String),
     #[error("revision '{0}' was not found")]
     RevisionNotFound(String),
     #[error("protocol error: {0}")]

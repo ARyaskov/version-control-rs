@@ -26,6 +26,10 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
     pub id: String,
+    /// Commit record format: 2 = the id is a hash of the whole record and is
+    /// verified on read; 0 = written before 0.3 (not verifiable).
+    #[serde(default)]
+    pub format: u32,
     #[serde(default)]
     pub revision: i64,
     pub parent: Option<String>,

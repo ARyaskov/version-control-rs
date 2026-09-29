@@ -738,7 +738,6 @@ impl Repository {
 
         let parent_id = parent.as_ref().map(|c| c.id.clone());
         let next_rev = wcdb.max_revision()? + 1;
-        let id = storage::new_commit_id(parent_id.as_deref(), message, author, &snapshot);
         let snapshot_map: BTreeMap<&str, &FileEntry> =
             snapshot.iter().map(|f| (f.path.as_str(), f)).collect();
         for ch in &changed {
@@ -797,22 +796,27 @@ impl Repository {
             .entry("svn:date".to_owned())
             .or_insert_with(|| Utc::now().to_rfc3339());
 
-        let commit = Commit {
-            id: id.clone(),
+        let mut commit = Commit {
+            id: String::new(),
+            format: storage::COMMIT_FORMAT,
             revision: next_rev,
             parent: parent_id,
             parent_revision,
             author: author.to_owned(),
             message: message.to_owned(),
             created_at: Utc::now(),
+            tree: Some(storage::write_tree(self, &snapshot)?),
             files: snapshot,
             changed_files: changed,
             mergeinfo,
             revprops,
             txn_id: None,
-            tree: None,
             changed_paths,
         };
+        // The id commits to the whole record (tree, parent, metadata), so any
+        // later modification of the stored commit is detected on read.
+        commit.id = storage::compute_commit_id(&commit)?;
+        let id = commit.id.clone();
 
         // Commit protocol (the repository lock is held throughout):
         //   1. blobs are already durable (fsync'd by the object store);
@@ -2040,13 +2044,10 @@ impl Repository {
         }
         mergeinfo = build_mergeinfo(&added, mergeinfo);
 
-        let rebased = Commit {
-            id: storage::new_commit_id(
-                Some(&new_parent.id),
-                &commit.message,
-                &commit.author,
-                &files,
-            ),
+        let mut rebased = Commit {
+            id: String::new(),
+            format: storage::COMMIT_FORMAT,
+            tree: Some(storage::write_tree(self, &files)?),
             revision,
             parent: Some(new_parent.id.clone()),
             parent_revision: Some(new_parent.revision),
@@ -2059,8 +2060,8 @@ impl Repository {
             mergeinfo,
             revprops: commit.revprops.clone(),
             txn_id: None,
-            tree: None,
         };
+        rebased.id = storage::compute_commit_id(&rebased)?;
         storage::write_commit(self, &rebased)?;
         Ok(rebased)
     }
