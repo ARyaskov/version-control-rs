@@ -183,10 +183,8 @@ impl Repository {
         }
 
         for path in &keys {
-            if let Some(scope) = scope_path {
-                if !path_in_scope(path, scope) {
-                    continue;
-                }
+            if scope_path.is_some_and(|scope| !path_in_scope(path, scope)) {
+                continue;
             }
             if !scope.contains(path) {
                 continue;

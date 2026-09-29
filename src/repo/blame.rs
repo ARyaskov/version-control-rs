@@ -38,9 +38,9 @@ impl Repository {
                 continue;
             };
             if file.is_binary {
-                return Err(VcsError::CommitNotFound(format!(
-                    "blame for binary file r{rev}:{path}"
-                )));
+                return Err(VcsError::BinaryFile {
+                    path: path.to_owned(),
+                });
             }
 
             let text = String::from_utf8_lossy(&self.read_blob(&file.blob_id)?).to_string();

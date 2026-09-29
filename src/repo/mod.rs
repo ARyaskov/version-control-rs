@@ -77,11 +77,15 @@ pub struct TreeEdits {
 }
 
 /// Where the content of a commit comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommitSource {
-    /// The working copy: it must be at HEAD; pending merges and scheduled
-    /// changes are consumed, BASE moves, local lock tokens are checked.
-    WorkingCopy,
+#[derive(Debug, Clone, Copy)]
+enum CommitSource<'a> {
+    /// The working copy: it must be at HEAD; pending merges and the
+    /// `committed` scheduled changes are consumed (`schedule` supplies copy
+    /// history), BASE moves, local lock tokens are checked.
+    WorkingCopy {
+        schedule: &'a BTreeMap<String, Scheduled>,
+        committed: &'a [String],
+    },
     /// Direct edits to the repository; the working copy is not involved.
     Store,
 }

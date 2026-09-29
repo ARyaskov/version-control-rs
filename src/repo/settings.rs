@@ -21,10 +21,8 @@ impl Repository {
                 )?;
             }
         }
-        if name == "svn:needs-lock" && !wcdb.has_lock_token(path)? {
-            if abs.exists() {
-                set_readonly_if_supported(&abs, true)?;
-            }
+        if name == "svn:needs-lock" && !wcdb.has_lock_token(path)? && abs.exists() {
+            set_readonly_if_supported(&abs, true)?;
         }
         self.sync_wcdb()
     }
@@ -53,7 +51,7 @@ impl Repository {
     }
 
     pub fn depth(&self) -> Result<Depth> {
-        Ok(Depth::from_str(&self.wcdb()?.depth()?).unwrap_or(Depth::Infinity))
+        Ok(self.wcdb()?.depth()?.parse().unwrap_or(Depth::Infinity))
     }
 
     /// A property of the working file: explicit properties plus those that
@@ -76,10 +74,8 @@ impl Repository {
         if abs.exists() && name == "svn:executable" {
             set_executable_if_supported(&abs, false)?;
         }
-        if name == "svn:needs-lock" {
-            if abs.exists() {
-                set_readonly_if_supported(&abs, false)?;
-            }
+        if name == "svn:needs-lock" && abs.exists() {
+            set_readonly_if_supported(&abs, false)?;
         }
         self.sync_wcdb()
     }

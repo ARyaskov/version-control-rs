@@ -103,7 +103,15 @@ impl Repository {
                 fs::read(&abs)?
             };
             let entry = self.finalize_entry(
-                &rel, raw, is_symlink, executable, file_props, &inherited, persist,
+                &rel,
+                raw,
+                EntryInputs {
+                    is_symlink,
+                    executable,
+                    file_props,
+                    inherited: &inherited,
+                },
+                persist,
             )?;
             if md.modified().is_ok_and(|m| m < racy_cutoff) {
                 fresh.push((
@@ -312,10 +320,12 @@ impl Repository {
         self.finalize_entry(
             rel,
             raw,
-            is_symlink,
-            executable,
-            &file_props,
-            &inherited,
+            EntryInputs {
+                is_symlink,
+                executable,
+                file_props: &file_props,
+                inherited: &inherited,
+            },
             persist,
         )
     }
@@ -324,14 +334,16 @@ impl Repository {
         &self,
         rel: &str,
         raw: Vec<u8>,
-        is_symlink: bool,
-        executable: bool,
-        file_props: &BTreeMap<String, String>,
-        inherited: &BTreeMap<String, String>,
+        inputs: EntryInputs<'_>,
         persist: bool,
     ) -> Result<FileEntry> {
-        let (bytes, props, is_binary) =
-            repo_form(raw, is_symlink, file_props, inherited, executable);
+        let (bytes, props, is_binary) = repo_form(
+            raw,
+            inputs.is_symlink,
+            inputs.file_props,
+            inputs.inherited,
+            inputs.executable,
+        );
         let executable = has_svn_prop(&props, "svn:executable");
         let blob_id = if persist {
             self.write_blob(&bytes)?
@@ -589,6 +601,14 @@ impl Repository {
 
         Ok(patterns)
     }
+}
+
+/// Everything besides the raw bytes that determines a working file's entry.
+pub(super) struct EntryInputs<'a> {
+    pub(super) is_symlink: bool,
+    pub(super) executable: bool,
+    pub(super) file_props: &'a BTreeMap<String, String>,
+    pub(super) inherited: &'a BTreeMap<String, String>,
 }
 
 /// Which BASE paths the working copy materializes (sparse depth, externals).
@@ -1115,7 +1135,7 @@ pub(super) fn path_allowed_by_ambient_depth(
         }
         if let Some((d, sticky)) = ambient.get(&current_prefix)
             && *sticky
-            && let Some(parsed) = Depth::from_str(d)
+            && let Ok(parsed) = d.parse::<Depth>()
         {
             current_depth = parsed;
         }
@@ -1135,7 +1155,7 @@ pub(super) fn depth_to_str(depth: Depth) -> &'static str {
 impl WcScope {
     pub(super) fn load(wcdb: &WcDb) -> Result<Self> {
         Ok(Self {
-            depth: Depth::from_str(&wcdb.depth()?).unwrap_or(Depth::Infinity),
+            depth: wcdb.depth()?.parse().unwrap_or(Depth::Infinity),
             ambient: wcdb.ambient_depth_map()?,
             externals: wcdb.list_externals()?.into_iter().map(|e| e.path).collect(),
         })

@@ -1236,3 +1236,45 @@ fn unsupported_remote_schemes_are_rejected() {
         );
     }
 }
+
+fn vcrs(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_vcrs"))
+        .args(args)
+        .current_dir(dir)
+        .envs(envs.iter().copied())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_reports_bad_arguments_and_defaults_the_author() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    assert!(vcrs(root, &["init", "."], &[]).status.success());
+    write(root, "a.txt", "a\n");
+    assert!(vcrs(root, &["add", "a.txt"], &[]).status.success());
+    let out = vcrs(
+        root,
+        &["commit", "-m", "r1", "--all"],
+        &[("VCRS_AUTHOR", "alice")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        Client::discover(root).unwrap().log(1).unwrap()[0].author,
+        "alice"
+    );
+
+    let out = vcrs(root, &["update", "--depth", "bogus"], &[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown depth"));
+
+    let out = vcrs(root, &["pull"], &[]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no remote repository configured"));
+
+    let out = vcrs(root, &["cat", "missing.txt@1"], &[]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not exist in r1"));
+}

@@ -4,6 +4,16 @@
 pub enum VcsError {
     #[error("repository not found (expected .vcrs directory)")]
     RepositoryNotFound,
+    #[error("no remote repository configured (use checkout or switch)")]
+    NoRemoteConfigured,
+    #[error("'{path}' is a binary file")]
+    BinaryFile { path: String },
+    #[error("path '{path}' does not exist in r{rev}")]
+    PathNotFoundAt { path: String, rev: i64 },
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("internal error: {0}")]
+    Internal(String),
     #[error("commit '{0}' was not found")]
     CommitNotFound(String),
     #[error("blob '{0}' was not found in the object store")]

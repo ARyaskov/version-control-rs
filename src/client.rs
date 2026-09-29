@@ -553,7 +553,10 @@ impl Client {
         let old_entry = self
             .repo
             .file_entry_at_revision(rev, &path)?
-            .ok_or_else(|| VcsError::CommitNotFound(format!("r{rev}:{path}")))?;
+            .ok_or_else(|| VcsError::PathNotFoundAt {
+                path: path.clone(),
+                rev,
+            })?;
 
         let current_abs = safe_join(&self.repo.root, &path)?;
         let new_bytes = if fs::symlink_metadata(&current_abs).is_ok() {
@@ -595,7 +598,10 @@ impl Client {
             .files
             .iter()
             .find(|f| f.path == path)
-            .ok_or_else(|| VcsError::CommitNotFound(format!("r{rev}:{path}")))?;
+            .ok_or_else(|| VcsError::PathNotFoundAt {
+                path: path.to_owned(),
+                rev,
+            })?;
         self.repo.read_blob(&file.blob_id)
     }
 
@@ -639,13 +645,13 @@ impl Client {
         if !self.status()?.is_empty() {
             return Err(VcsError::WorkingCopyDirty);
         }
-        let cfg = self.remote_config()?.ok_or(VcsError::RepositoryNotFound)?;
+        let cfg = self.remote_config()?.ok_or(VcsError::NoRemoteConfigured)?;
         let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
         ra.pull(&self.repo.root)
     }
 
     pub fn push_remote(&self) -> Result<()> {
-        let cfg = self.remote_config()?.ok_or(VcsError::RepositoryNotFound)?;
+        let cfg = self.remote_config()?.ok_or(VcsError::NoRemoteConfigured)?;
         let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
         ra.push(&self.repo.root)
     }
@@ -659,7 +665,7 @@ impl Client {
     }
 
     pub fn lock_remote(&self, path: &str) -> Result<()> {
-        let cfg = self.remote_config()?.ok_or(VcsError::RepositoryNotFound)?;
+        let cfg = self.remote_config()?.ok_or(VcsError::NoRemoteConfigured)?;
         let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
         let lock = ra.lock(path)?;
         self.repo
@@ -667,7 +673,7 @@ impl Client {
     }
 
     pub fn unlock_remote(&self, path: &str) -> Result<()> {
-        let cfg = self.remote_config()?.ok_or(VcsError::RepositoryNotFound)?;
+        let cfg = self.remote_config()?.ok_or(VcsError::NoRemoteConfigured)?;
         let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
         ra.unlock(path)?;
         self.repo.set_lock_token_local(path, None, None)

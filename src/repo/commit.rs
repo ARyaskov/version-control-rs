@@ -27,9 +27,10 @@ impl Repository {
             message,
             author,
             revprops,
-            &schedule,
-            &committed,
-            CommitSource::WorkingCopy,
+            CommitSource::WorkingCopy {
+                schedule: &schedule,
+                committed: &committed,
+            },
         )
     }
 
@@ -62,12 +63,19 @@ impl Repository {
         message: &str,
         author: &str,
         mut revprops: BTreeMap<String, String>,
-        schedule: &BTreeMap<String, Scheduled>,
-        committed_schedule: &[String],
-        source: CommitSource,
+        source: CommitSource<'_>,
     ) -> Result<Commit> {
         let wcdb = self.wcdb()?;
-        let from_wc = source == CommitSource::WorkingCopy;
+        let from_wc = matches!(source, CommitSource::WorkingCopy { .. });
+        let empty = BTreeMap::new();
+        let (schedule, committed_schedule): (&BTreeMap<String, Scheduled>, &[String]) = match source
+        {
+            CommitSource::WorkingCopy {
+                schedule,
+                committed,
+            } => (schedule, committed),
+            CommitSource::Store => (&empty, &[]),
+        };
 
         if from_wc {
             let base_rev = wcdb.base_revision()?;
@@ -321,8 +329,6 @@ impl Repository {
             message,
             author,
             revprops,
-            &BTreeMap::new(),
-            &[],
             CommitSource::Store,
         )
     }
@@ -382,9 +388,10 @@ impl Repository {
             message,
             author,
             revprops,
-            &schedule,
-            &committed,
-            CommitSource::WorkingCopy,
+            CommitSource::WorkingCopy {
+                schedule: &schedule,
+                committed: &committed,
+            },
         )
     }
 }

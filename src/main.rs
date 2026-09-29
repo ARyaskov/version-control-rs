@@ -98,8 +98,9 @@ struct CatArgs {
 struct CommitArgs {
     #[arg(short = 'm', long)]
     message: String,
-    #[arg(long, default_value = "unknown")]
-    author: String,
+    /// Commit author (default: $VCRS_AUTHOR, then the login name).
+    #[arg(long)]
+    author: Option<String>,
     #[arg(long)]
     push: bool,
     #[arg(long)]
@@ -409,7 +410,7 @@ fn run(cli: Cli) -> Result<()> {
                 "theirs-full" => ResolveAccept::TheirsFull,
                 "base" => ResolveAccept::Base,
                 other => {
-                    return Err(VcsError::Protocol(format!(
+                    return Err(VcsError::InvalidArgument(format!(
                         "unknown --accept value '{other}' (expected working, mine-full, theirs-full or base)"
                     )));
                 }
@@ -426,7 +427,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Checkout(args) => {
             let client = Client::checkout_remote(&args.url, &args.path, args.username.as_deref())?;
-            if let Some(depth) = args.depth.as_deref().and_then(Depth::from_str) {
+            if let Some(depth) = args.depth.as_deref().map(str::parse::<Depth>).transpose()? {
                 client.set_depth(depth)?;
             }
             if json_output {
@@ -615,14 +616,15 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Commit(args) => {
             let client = Client::discover(".")?;
+            let author = args.author.clone().unwrap_or_else(default_author);
             let result = if args.all {
                 if args.push {
-                    client.commit_and_push(&args.message, &args.author)
+                    client.commit_and_push(&args.message, &author)
                 } else {
-                    client.commit(&args.message, &args.author)
+                    client.commit(&args.message, &author)
                 }
             } else {
-                client.commit_staged(&args.message, &args.author, args.push)
+                client.commit_staged(&args.message, &author, args.push)
             };
             let commit = match result {
                 Err(VcsError::NothingToCommit) | Err(VcsError::NoStagedChanges) => {
@@ -761,7 +763,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Update(args) => {
             let client = Client::discover(".")?;
-            let depth = args.depth.as_deref().and_then(Depth::from_str);
+            let depth = args.depth.as_deref().map(str::parse::<Depth>).transpose()?;
             let changed = client.update_to_revision_with_depth(&args.revision, depth)?;
             if json_output {
                 print_json(json!({
@@ -1160,7 +1162,7 @@ fn run(cli: Cli) -> Result<()> {
             std::io::stdin().read_line(&mut password)?;
             let password = password.trim_end_matches(['\r', '\n']);
             if password.is_empty() {
-                return Err(VcsError::Protocol(
+                return Err(VcsError::InvalidArgument(
                     "empty password (pipe it on stdin, e.g. `read -s P; echo \"$P\" | vcrs passwd alice`)".to_owned(),
                 ));
             }
@@ -1214,6 +1216,17 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Commit author when `--author` is not given: `$VCRS_AUTHOR`, then the
+/// login name, then "unknown".
+fn default_author() -> String {
+    ["VCRS_AUTHOR", "USER", "USERNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_owned())
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Resolve a path typed on the command line (relative to the current

@@ -108,14 +108,18 @@ pub enum Depth {
     Infinity,
 }
 
-impl Depth {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for Depth {
+    type Err = crate::error::VcsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "empty" => Some(Self::Empty),
-            "files" => Some(Self::Files),
-            "immediates" => Some(Self::Immediates),
-            "infinity" => Some(Self::Infinity),
-            _ => None,
+            "empty" => Ok(Self::Empty),
+            "files" => Ok(Self::Files),
+            "immediates" => Ok(Self::Immediates),
+            "infinity" => Ok(Self::Infinity),
+            other => Err(crate::error::VcsError::InvalidArgument(format!(
+                "unknown depth '{other}' (expected empty, files, immediates or infinity)"
+            ))),
         }
     }
 }

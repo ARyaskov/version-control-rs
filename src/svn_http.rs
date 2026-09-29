@@ -198,7 +198,7 @@ async fn svn_entry(
     // Authenticate before doing anything else.
     let identity = match authenticate(&state, &req) {
         Ok(identity) => identity,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let user = identity.name.as_str();
 
@@ -455,7 +455,7 @@ async fn svn_entry(
                 let _guard = state
                     .commit_lock
                     .lock()
-                    .map_err(|_| VcsError::RepositoryNotFound)?;
+                    .map_err(|_| VcsError::Internal("commit lock poisoned".to_owned()))?;
                 apply_activity_commit(&repo_root, activity, log_msg, hooks)
             })
             .await;
@@ -662,7 +662,7 @@ struct PasswdFile {
 fn authenticate(
     state: &AppState,
     req: &HttpRequest,
-) -> std::result::Result<Identity, HttpResponse> {
+) -> std::result::Result<Identity, Box<HttpResponse>> {
     let passwd_path = state.repo_root.join(".vcrs").join("passwd.json");
     if !passwd_path.exists() {
         return Ok(Identity {
@@ -673,13 +673,17 @@ fn authenticate(
 
     let passwd = match load_passwd(&passwd_path) {
         Ok(p) => p,
-        Err(_) => return Err(HttpResponse::InternalServerError().body("invalid passwd file")),
+        Err(_) => {
+            return Err(Box::new(
+                HttpResponse::InternalServerError().body("invalid passwd file"),
+            ));
+        }
     };
     let Some((user, pass)) = parse_basic_auth(req) else {
-        return Err(auth_challenge());
+        return Err(Box::new(auth_challenge()));
     };
     let Some(stored) = passwd.users.get(&user) else {
-        return Err(auth_challenge());
+        return Err(Box::new(auth_challenge()));
     };
     let key = {
         let mut h = blake3::Hasher::new();
@@ -695,7 +699,7 @@ fn authenticate(
         .is_ok_and(|cache| cache.contains(&key));
     if !cached {
         if !verify_password(stored, &pass) {
-            return Err(auth_challenge());
+            return Err(Box::new(auth_challenge()));
         }
         if let Ok(mut cache) = state.auth_cache.lock() {
             if cache.len() >= AUTH_CACHE_LIMIT {
