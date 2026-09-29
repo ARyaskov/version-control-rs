@@ -588,28 +588,35 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Commit(args) => {
             let client = Client::discover(".")?;
-            let status = client.status()?;
-            if status.is_empty() {
-                if json_output {
-                    print_json(json!({
-                        "ok": true,
-                        "command": "commit",
-                        "noop": true,
-                        "message": "No local changes to commit",
-                    }))?;
-                } else {
-                    println!("No local changes to commit");
-                }
-                return Ok(());
-            }
-            let commit = if args.all {
+            let result = if args.all {
                 if args.push {
-                    client.commit_and_push(&args.message, &args.author)?
+                    client.commit_and_push(&args.message, &args.author)
                 } else {
-                    client.commit(&args.message, &args.author)?
+                    client.commit(&args.message, &args.author)
                 }
             } else {
-                client.commit_staged(&args.message, &args.author, args.push)?
+                client.commit_staged(&args.message, &args.author, args.push)
+            };
+            let commit = match result {
+                Err(VcsError::NothingToCommit) | Err(VcsError::NoStagedChanges) => {
+                    let message = if args.all {
+                        "No local changes to commit"
+                    } else {
+                        "No staged changes to commit (stage paths or use --all)"
+                    };
+                    if json_output {
+                        print_json(json!({
+                            "ok": true,
+                            "command": "commit",
+                            "noop": true,
+                            "message": message,
+                        }))?;
+                    } else {
+                        println!("{message}");
+                    }
+                    return Ok(());
+                }
+                other => other?,
             };
             if json_output {
                 print_json(json!({

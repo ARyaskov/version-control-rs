@@ -9,7 +9,7 @@ use crate::types::{Commit, FileChange, FileEntry};
 
 /// Bump when the schema below changes so existing working copies re-run the
 /// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug)]
 pub struct WcDb {
@@ -222,6 +222,10 @@ impl WcDb {
                 token TEXT NOT NULL,
                 owner TEXT
             );
+
+            -- Before 0.3, merge --record-only also queued its revision here and
+            -- the queue re-added it with scope "/" on the next run.
+            DELETE FROM work_queue;
 
             CREATE TABLE IF NOT EXISTS conflicts (
                 path TEXT PRIMARY KEY,
@@ -461,33 +465,6 @@ impl WcDb {
         self.with_write_tx(|tx| {
             tx.execute("DELETE FROM conflicts WHERE path=?1", params![path])?;
             Ok(())
-        })
-    }
-
-    pub fn enqueue_work(&self, work_json: &str) -> Result<i64> {
-        self.with_write_tx(|tx| {
-            tx.execute(
-                "INSERT INTO work_queue(work_json) VALUES(?1)",
-                params![work_json],
-            )?;
-            Ok(tx.last_insert_rowid())
-        })
-    }
-
-    pub fn dequeue_work(&self) -> Result<Option<String>> {
-        self.with_write_tx(|tx| {
-            let row: Option<(i64, String)> = {
-                let mut stmt =
-                    tx.prepare("SELECT id, work_json FROM work_queue ORDER BY id LIMIT 1")?;
-                stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?
-            };
-            if let Some((id, work)) = row {
-                tx.execute("DELETE FROM work_queue WHERE id=?1", params![id])?;
-                Ok(Some(work))
-            } else {
-                Ok(None)
-            }
         })
     }
 

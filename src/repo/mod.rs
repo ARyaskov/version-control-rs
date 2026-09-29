@@ -105,7 +105,6 @@ impl Repository {
         let wcdb = self.wcdb()?;
         self.migrate_legacy_layout()?;
         self.migrate_explicit_props(&wcdb)?;
-        self.process_work_queue()?;
         if self.head_commit_id()?.is_none() {
             wcdb.set_base_revision(0)?;
             self.sync_wcdb()?;
@@ -609,8 +608,9 @@ impl Repository {
 
         let base_rev = wcdb.base_revision()?;
         let head_rev = wcdb.head_revision()?;
-        let has_pending_merges = !wcdb.pending_merges()?.is_empty();
-        if base_rev != head_rev && !has_pending_merges {
+        // Recorded merges do not exempt a stale working copy: committing on
+        // top of an outdated BASE would silently discard newer revisions.
+        if base_rev != head_rev {
             return Err(VcsError::OutOfDate { base_rev, head_rev });
         }
 
@@ -624,21 +624,7 @@ impl Repository {
         let pending_merges = wcdb.pending_merges()?;
 
         if changed.is_empty() && pending_merges.is_empty() {
-            return Ok(parent.unwrap_or(Commit {
-                id: String::new(),
-                revision: head_rev,
-                parent: None,
-                parent_revision: None,
-                author: author.to_owned(),
-                message: message.to_owned(),
-                created_at: Utc::now(),
-                files: snapshot,
-                changed_files: Vec::new(),
-                mergeinfo: BTreeMap::new(),
-                revprops: BTreeMap::new(),
-                txn_id: None,
-                changed_paths: Vec::new(),
-            }));
+            return Err(VcsError::NothingToCommit);
         }
 
         // Refuse to commit paths with a recorded, unresolved conflict, and
@@ -741,7 +727,11 @@ impl Repository {
         // Working-copy node metadata is derived data: the commit is already
         // durable, and the next status/sync repairs it if this refresh fails.
         let _ = self.sync_wcdb();
-        self.run_hook("post-commit", &[&next_rev.to_string(), &id])?;
+        // The revision is published: a failing post-commit hook must not turn
+        // a successful commit into an error. Its output is kept for review.
+        if let Err(err) = self.run_hook("post-commit", &[&next_rev.to_string(), &id]) {
+            self.log_hook_failure(&err);
+        }
         Ok(commit)
     }
 
@@ -1462,6 +1452,15 @@ impl Repository {
         WcDb::open(&self.root)
     }
 
+    /// Append a hook failure to `.vcrs/hooks.log` (best effort).
+    fn log_hook_failure(&self, err: &VcsError) {
+        use std::io::Write as _;
+        let path = self.root.join(VCRS_DIR).join("hooks.log");
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{} {err}", Utc::now().to_rfc3339());
+        }
+    }
+
     fn run_hook(&self, hook_name: &str, args: &[&str]) -> Result<()> {
         if !self.hooks_enabled {
             return Ok(());
@@ -1588,20 +1587,6 @@ impl Repository {
             rows.push(RevisionRow::from_commit(c)?);
         }
         self.wcdb()?.replace_revisions(&rows, &edges)
-    }
-
-    fn process_work_queue(&self) -> Result<()> {
-        let wcdb = self.wcdb()?;
-        while let Some(work) = wcdb.dequeue_work()? {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&work).unwrap_or_else(|_| serde_json::json!({}));
-            if let Some(mark) = parsed.get("record-only").and_then(|v| v.as_str())
-                && let Ok(rev) = mark.parse::<i64>()
-            {
-                wcdb.add_pending_merge("/", rev)?;
-            }
-        }
-        Ok(())
     }
 
     /// After the depth was narrowed, remove BASE files that fell out of the
@@ -2118,9 +2103,10 @@ fn apply_scheduled_copies(changes: &mut [FileChange], schedule: &BTreeMap<String
         .collect();
     let mut moves = Vec::new();
     for ch in changes.iter_mut() {
-        if ch.kind != ChangeKind::Added {
+        if ch.kind == ChangeKind::Deleted {
             continue;
         }
+        // Added: a copy/move; Modified: a BASE path deleted and replaced by a copy.
         if let Some(src) = schedule.get(&ch.path).and_then(|s| s.copy_from.clone()) {
             ch.moved_from = deleted.contains(&src).then(|| src.clone());
             if ch.moved_from.is_some() {
@@ -2289,13 +2275,10 @@ fn build_changed_paths(parent: Option<&Commit>, changes: &[FileChange]) -> Vec<C
     let mut out = Vec::new();
     for ch in changes {
         let action = match ch.kind {
-            ChangeKind::Added => {
-                if ch.copy_from.is_some() {
-                    ChangedPathAction::Replace
-                } else {
-                    ChangedPathAction::Add
-                }
-            }
+            // An addition with history is still an addition (svn "A +"); a
+            // replacement is a path deleted and re-added from another source.
+            ChangeKind::Added => ChangedPathAction::Add,
+            ChangeKind::Modified if ch.copy_from.is_some() => ChangedPathAction::Replace,
             ChangeKind::Modified => ChangedPathAction::Modify,
             ChangeKind::Deleted => ChangedPathAction::Delete,
         };

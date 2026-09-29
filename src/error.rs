@@ -44,6 +44,8 @@ pub enum VcsError {
     InvalidPath { path: String, reason: &'static str },
     #[error("server misconfiguration: {0}")]
     ServerMisconfigured(String),
+    #[error("nothing to commit: no local changes")]
+    NothingToCommit,
     #[error("no staged changes to commit")]
     NoStagedChanges,
     #[error("hunk staging is not supported for path '{path}'")]

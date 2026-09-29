@@ -295,7 +295,12 @@ fn concurrent_commits_are_serialized() {
                     let path = format!("t{t}/f{i}.txt");
                     write(&root, &path, &format!("{t}-{i}\n"));
                     client.add(&[path]).unwrap();
-                    client.commit(&format!("t{t} c{i}"), "a").unwrap();
+                    // Another thread's commit may already have included this
+                    // file; then there is nothing left to commit.
+                    match client.commit(&format!("t{t} c{i}"), "a") {
+                        Ok(_) | Err(version_control_rs::VcsError::NothingToCommit) => {}
+                        Err(e) => panic!("{e}"),
+                    }
                 }
             })
         })
@@ -804,4 +809,69 @@ fn stale_hunk_selection_is_refused() {
     client.commit_staged("partial", "a", false).unwrap();
     let committed = String::from_utf8(client.cat_revision_file("2", "f.txt").unwrap()).unwrap();
     assert_eq!(committed, text("2", "XXVIII"));
+}
+
+#[test]
+fn empty_commit_is_an_error_not_a_fake_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    assert!(matches!(
+        client.commit("nothing", "a"),
+        Err(version_control_rs::VcsError::NothingToCommit)
+    ));
+}
+
+#[test]
+fn record_only_merge_is_committed_once_and_respects_out_of_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = merge_fixture(root);
+    client.merge("sub@2", false, true).unwrap();
+    // Reopen: the old work queue re-added the merge with scope "/".
+    let client = Client::discover(root).unwrap();
+    let c4 = client.commit("record", "a").unwrap();
+    assert_eq!(c4.mergeinfo.get("sub").map(String::as_str), Some("2"));
+    assert!(!c4.mergeinfo.contains_key("/"), "{:?}", c4.mergeinfo);
+
+    // A stale working copy cannot commit even with recorded merges.
+    client.update_to_revision("3").unwrap();
+    client.merge("1", false, true).unwrap();
+    assert!(matches!(
+        client.commit("stale", "a"),
+        Err(version_control_rs::VcsError::OutOfDate { .. })
+    ));
+}
+
+#[test]
+fn copies_are_additions_with_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "a.txt", "a\n");
+    add(&client, &["a.txt"]);
+    client.commit("r1", "a").unwrap();
+    client.copy_path("a.txt", "b.txt").unwrap();
+    let c2 = client.commit("copy", "a").unwrap();
+    let cp = c2.changed_paths.iter().find(|p| p.path == "b.txt").unwrap();
+    assert_eq!(cp.action, version_control_rs::ChangedPathAction::Add);
+    assert_eq!(cp.copyfrom_path.as_deref(), Some("a.txt"));
+    assert_eq!(cp.copyfrom_rev, Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn failing_post_commit_hook_does_not_fail_the_commit() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    let hook = root.join(".vcrs/hooks/post-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\necho boom >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    write(root, "a.txt", "a\n");
+    add(&client, &["a.txt"]);
+    assert_eq!(client.commit("r1", "a").unwrap().revision, 1);
+    assert!(read(root, ".vcrs/hooks.log").contains("boom"));
 }
