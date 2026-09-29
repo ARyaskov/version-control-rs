@@ -942,3 +942,79 @@ fn conflicting_pull_changes_nothing_and_push_stays_refused() {
     let srv = Client::discover(dir.path().join("srv")).unwrap();
     assert_eq!(srv.log(1).unwrap()[0].message, "A edit");
 }
+
+#[test]
+fn path_locks_are_exclusive_and_enforced_on_commit() {
+    use version_control_rs::TreeEdits;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let client = Client::init(&root).unwrap();
+    write(&root, "a.txt", "a\n");
+    write(&root, "doc.bin", "d\n");
+    add(&client, &["a.txt", "doc.bin"]);
+    client
+        .set_property("doc.bin", "svn:needs-lock", "*")
+        .unwrap();
+    client.commit("r1", "a").unwrap();
+
+    // Concurrent LOCK requests: exactly one user wins.
+    let winners: Vec<_> = (0..8)
+        .map(|i| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                Repository::discover(&root)
+                    .unwrap()
+                    .lock_path("a.txt", &format!("user{i}"))
+                    .is_ok()
+            })
+        })
+        .map(|t| t.join().unwrap())
+        .collect();
+    assert_eq!(winners.iter().filter(|w| **w).count(), 1);
+
+    let repo = Repository::discover(&root).unwrap();
+    let holder = repo.path_locks().unwrap()["a.txt"].owner.clone();
+    let edit = |path: &str| TreeEdits {
+        puts: [(path.to_owned(), b"changed\n".to_vec())].into(),
+        ..TreeEdits::default()
+    };
+    assert!(matches!(
+        repo.commit_edits(&edit("a.txt"), "m", "intruder"),
+        Err(version_control_rs::VcsError::LockConflict { .. })
+    ));
+    assert_eq!(
+        repo.commit_edits(&edit("a.txt"), "m", &holder)
+            .unwrap()
+            .revision,
+        2
+    );
+
+    // svn:needs-lock files require holding the lock.
+    assert!(matches!(
+        repo.commit_edits(&edit("doc.bin"), "m", "bob"),
+        Err(version_control_rs::VcsError::NeedsLockRequired { .. })
+    ));
+    repo.lock_path("doc.bin", "bob").unwrap();
+    assert!(
+        repo.unlock_path("doc.bin", "eve").is_err(),
+        "only the owner unlocks"
+    );
+    assert_eq!(
+        repo.commit_edits(&edit("doc.bin"), "m", "bob")
+            .unwrap()
+            .revision,
+        3
+    );
+    repo.unlock_path("doc.bin", "bob").unwrap();
+}
+
+#[test]
+fn legacy_json_locks_are_imported() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    Client::init(root).unwrap();
+    fs::write(root.join(".vcrs/locks.json"), r#"{"a.txt":"alice"}"#).unwrap();
+    let repo = Repository::discover(root).unwrap();
+    assert_eq!(repo.path_locks().unwrap()["a.txt"].owner, "alice");
+    assert!(!root.join(".vcrs/locks.json").exists());
+}

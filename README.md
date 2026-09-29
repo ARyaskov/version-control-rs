@@ -90,6 +90,7 @@ vcrs ignore list
 vcrs externals set vendor/lib https://example.com/svn/lib --revision 123
 vcrs externals list
 
+vcrs passwd alice --repo .       # password read from stdin, stored hashed
 vcrs serve-http --repo . --host 127.0.0.1 --port 3690
 ```
 
@@ -135,6 +136,30 @@ BASE and un-schedules additions (the files stay on disk, unversioned).
 - Properties and grouping: `prop-set`, `prop-get`, `prop-del`, `iprop-set`, `iprop-list`, `changelist set|clear|list`
 - Metadata rules: `ignore add|list`, `externals set|list`
 - Server mode: `serve-http`
+
+### Server security
+
+- **Authentication.** Accounts live in `.vcrs/passwd.json` as Argon2 hashes;
+  create them with `vcrs passwd <user>` (password on stdin). Plain-text
+  entries are refused at startup. Without `passwd.json` every client is
+  anonymous (the `SVN-UserName` header is ignored) and writes are refused
+  unless the server runs with `--allow-anonymous-write`.
+- **Authorization.** `.vcrs/authz.json` grants `read`/`write` path prefixes per
+  user (`{"users": {"alice": {"read": ["/"], "write": ["/docs"]}}}`). Rules are
+  checked against the real file paths of every request, including the
+  contents of update/log reports and each path of a commit. `authz.json`
+  without `passwd.json` is refused.
+- **Transport.** Basic credentials are only protected by TLS. The server binds
+  to loopback by default and refuses other addresses unless
+  `--allow-insecure-http` is given; put a TLS-terminating reverse proxy in
+  front for network access.
+- **Hooks** are not executed for HTTP commits unless `--enable-hooks`.
+- **Locks** (`LOCK`/`vcrs lock`) are stored in the repository database, taken
+  atomically, and enforced on commit: nobody else can commit a locked path,
+  and `svn:needs-lock` files require holding the lock.
+- **`file://` access** is plain filesystem access: whoever can open the
+  repository directory can read and write it, and the username is only used
+  as lock owner. `authz.json`/`passwd.json` apply to the HTTP server only.
 
 `serve-http` exposes a partial SVN/DAV compatibility layer intended as a foundation.
 Read/discovery/report paths are implemented first; full interoperability with a stock `svn` client

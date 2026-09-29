@@ -1,3 +1,5 @@
+#[cfg(feature = "serve-http")]
+pub mod auth;
 pub mod client;
 pub mod diff;
 pub mod error;
@@ -18,4 +20,4 @@ pub use types::{
     BlameLine, ChangeKind, ChangedPath, ChangedPathAction, Commit, Depth, DiffHunk, FileChange,
     FileEntry, RevisionRange,
 };
-pub use wcdb::{ConflictRecord, ExternalDef};
+pub use wcdb::{ConflictRecord, ExternalDef, PathLock};

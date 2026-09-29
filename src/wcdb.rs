@@ -9,7 +9,7 @@ use crate::types::{Commit, FileChange, FileEntry};
 
 /// Bump when the schema below changes so existing working copies re-run the
 /// idempotent `CREATE TABLE IF NOT EXISTS` block exactly once.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug)]
 pub struct WcDb {
@@ -29,6 +29,14 @@ pub enum ScheduleOp {
 pub struct Scheduled {
     pub op: ScheduleOp,
     pub copy_from: Option<String>,
+}
+
+/// A repository-level (svn) lock on a path, held by `owner`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PathLock {
+    pub owner: String,
+    pub token: String,
+    pub created_at: String,
 }
 
 /// An unresolved conflict: `kind` is `text` (with artifact files, paths
@@ -226,6 +234,13 @@ impl WcDb {
             -- Before 0.3, merge --record-only also queued its revision here and
             -- the queue re-added it with scope "/" on the next run.
             DELETE FROM work_queue;
+
+            CREATE TABLE IF NOT EXISTS repo_locks (
+                path TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                token TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS conflicts (
                 path TEXT PRIMARY KEY,
@@ -850,6 +865,79 @@ impl WcDb {
                 tx.execute("DELETE FROM schedule WHERE path=?1", params![path])?;
             }
             Ok(())
+        })
+    }
+
+    /// Repository-level locks by path.
+    pub fn path_locks(&self) -> Result<BTreeMap<String, PathLock>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, owner, token, created_at FROM repo_locks")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                PathLock {
+                    owner: r.get(1)?,
+                    token: r.get(2)?,
+                    created_at: r.get(3)?,
+                },
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (path, lock) = row?;
+            out.insert(path, lock);
+        }
+        Ok(out)
+    }
+
+    /// Atomically take the lock on `path` for `owner` (check and insert in one
+    /// IMMEDIATE transaction, so two clients cannot both win). Returns the
+    /// holder's lock: `owner`'s (new or existing) or another user's.
+    pub fn acquire_path_lock(&self, path: &str, candidate: &PathLock) -> Result<PathLock> {
+        self.with_write_tx(|tx| {
+            let existing: Option<PathLock> = tx
+                .query_row(
+                    "SELECT owner, token, created_at FROM repo_locks WHERE path=?1",
+                    params![path],
+                    |r| {
+                        Ok(PathLock {
+                            owner: r.get(0)?,
+                            token: r.get(1)?,
+                            created_at: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(lock) = existing {
+                return Ok(lock);
+            }
+            tx.execute(
+                "INSERT INTO repo_locks(path, owner, token, created_at) VALUES(?1,?2,?3,?4)",
+                params![path, candidate.owner, candidate.token, candidate.created_at],
+            )?;
+            Ok(candidate.clone())
+        })
+    }
+
+    /// Release `owner`'s lock on `path`. Returns the other holder when the
+    /// lock belongs to someone else (nothing is removed then).
+    pub fn release_path_lock(&self, path: &str, owner: &str) -> Result<Option<String>> {
+        self.with_write_tx(|tx| {
+            let holder: Option<String> = tx
+                .query_row(
+                    "SELECT owner FROM repo_locks WHERE path=?1",
+                    params![path],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match holder {
+                Some(h) if h != owner => Ok(Some(h)),
+                _ => {
+                    tx.execute("DELETE FROM repo_locks WHERE path=?1", params![path])?;
+                    Ok(None)
+                }
+            }
         })
     }
 

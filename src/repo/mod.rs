@@ -20,7 +20,9 @@ use crate::types::{
     BlameLine, ChangeKind, ChangedPath, ChangedPathAction, Commit, Depth, FileChange, FileEntry,
     RevisionRange,
 };
-use crate::wcdb::{ConflictRecord, ExternalDef, RevisionRow, ScheduleOp, Scheduled, WcDb};
+use crate::wcdb::{
+    ConflictRecord, ExternalDef, PathLock, RevisionRow, ScheduleOp, Scheduled, WcDb,
+};
 
 pub(crate) const VCRS_DIR: &str = ".vcrs";
 
@@ -724,6 +726,26 @@ impl Repository {
                     path: ch.path.clone(),
                 });
             }
+        }
+        // Repository-level locks: nobody commits over someone else's lock. For
+        // direct (server) commits svn:needs-lock also requires holding one;
+        // working-copy commits check their local lock token above.
+        let locks = self.path_locks()?;
+        if !from_wc {
+            self.check_path_locks(
+                author,
+                parent.as_ref().map(|c| c.files.as_slice()),
+                &snapshot,
+                &changed,
+            )?;
+        } else if let Some(ch) = changed
+            .iter()
+            .find(|ch| locks.get(&ch.path).is_some_and(|l| l.owner != author))
+        {
+            return Err(VcsError::LockConflict {
+                path: ch.path.clone(),
+                owner: locks[&ch.path].owner.clone(),
+            });
         }
         for ch in &changed {
             if ch.kind == ChangeKind::Added
@@ -1565,6 +1587,85 @@ impl Repository {
         Ok(())
     }
 
+    /// Take the repository-level lock on `path` for `owner`; locking a path
+    /// you already hold returns the existing lock.
+    pub fn lock_path(&self, path: &str, owner: &str) -> Result<PathLock> {
+        crate::path::validate_rel_path(path)?;
+        let now = Utc::now();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(path.as_bytes());
+        hasher.update(owner.as_bytes());
+        hasher.update(&now.timestamp_nanos_opt().unwrap_or_default().to_le_bytes());
+        hasher.update(&std::process::id().to_le_bytes());
+        let candidate = PathLock {
+            owner: owner.to_owned(),
+            token: format!("opaquelocktoken:{}", hasher.finalize().to_hex()),
+            created_at: now.to_rfc3339(),
+        };
+        let held = self.wcdb()?.acquire_path_lock(path, &candidate)?;
+        if held.owner != owner {
+            return Err(VcsError::LockConflict {
+                path: path.to_owned(),
+                owner: held.owner,
+            });
+        }
+        Ok(held)
+    }
+
+    /// Release `owner`'s repository-level lock on `path`.
+    pub fn unlock_path(&self, path: &str, owner: &str) -> Result<()> {
+        match self.wcdb()?.release_path_lock(path, owner)? {
+            Some(holder) => Err(VcsError::LockConflict {
+                path: path.to_owned(),
+                owner: holder,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Repository-level locks by path.
+    pub fn path_locks(&self) -> Result<BTreeMap<String, PathLock>> {
+        self.wcdb()?.path_locks()
+    }
+
+    /// Refuse a commit by `author` that touches a path locked by someone
+    /// else, or modifies/deletes an `svn:needs-lock` file `author` has not
+    /// locked. `parent` is the tree the changes apply to.
+    pub(crate) fn check_path_locks(
+        &self,
+        author: &str,
+        parent: Option<&[FileEntry]>,
+        new_files: &[FileEntry],
+        changed: &[FileChange],
+    ) -> Result<()> {
+        let locks = self.path_locks()?;
+        let needs_lock = |files: Option<&[FileEntry]>, path: &str| {
+            files
+                .and_then(|fs| fs.iter().find(|f| f.path == path))
+                .is_some_and(|f| has_svn_prop(&f.props, "svn:needs-lock"))
+        };
+        for ch in changed {
+            let held_by_author = match locks.get(&ch.path) {
+                Some(lock) if lock.owner != author => {
+                    return Err(VcsError::LockConflict {
+                        path: ch.path.clone(),
+                        owner: lock.owner.clone(),
+                    });
+                }
+                Some(_) => true,
+                None => false,
+            };
+            let requires = ch.kind != ChangeKind::Added
+                && (needs_lock(parent, &ch.path) || needs_lock(Some(new_files), &ch.path));
+            if requires && !held_by_author {
+                return Err(VcsError::NeedsLockRequired {
+                    path: ch.path.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn clear_local_lock_tokens(&self) -> Result<()> {
         let _lock = self.lock()?;
         self.wcdb()?.clear_all_lock_tokens()
@@ -1681,6 +1782,18 @@ impl Repository {
                 self.index_chain(Some(head))?;
             }
             fs::remove_file(&head_file)?;
+        }
+        // Locks used to live in a JSON file rewritten without atomicity.
+        let locks_file = vcrs.join("locks.json");
+        if locks_file.exists() {
+            let legacy: BTreeMap<String, String> =
+                serde_json::from_slice(&fs::read(&locks_file)?).unwrap_or_default();
+            for (path, owner) in legacy {
+                if crate::path::validate_rel_path(&path).is_ok() {
+                    let _ = self.lock_path(&path, &owner);
+                }
+            }
+            fs::remove_file(&locks_file)?;
         }
         let transactions = vcrs.join("transactions");
         if transactions.exists() {

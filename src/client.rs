@@ -650,10 +650,9 @@ impl Client {
     pub fn lock_remote(&self, path: &str) -> Result<()> {
         let cfg = self.remote_config()?.ok_or(VcsError::RepositoryNotFound)?;
         let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
-        ra.lock(path)?;
-        let owner = cfg.username.as_deref().unwrap_or("anonymous");
+        let lock = ra.lock(path)?;
         self.repo
-            .set_lock_token_local(path, Some(&format!("token:{path}")), Some(owner))
+            .set_lock_token_local(path, Some(&lock.token), Some(&lock.owner))
     }
 
     pub fn unlock_remote(&self, path: &str) -> Result<()> {

@@ -27,10 +27,13 @@ path = "src/main.rs"
 default = ["serve-http"]
 # The HTTP/WebDAV server and its heavy async/XML/compression stack. Disable with
 # `--no-default-features` for a much smaller, faster-to-build CLI/library.
-serve-http = ["dep:actix-web", "dep:quick-xml", "dep:uuid", "dep:flate2"]
+serve-http = ["dep:actix-web", "dep:quick-xml", "dep:uuid", "dep:flate2", "dep:argon2", "dep:password-hash"]
 
 [dependencies]
 actix-web = { version = "4.11", optional = true }
+argon2 = { version = "0.5", optional = true }
+# Salt generation for argon2 password hashes (OS randomness).
+password-hash = { version = "0.5", features = ["getrandom"], optional = true }
 base64 = "0.22"
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }

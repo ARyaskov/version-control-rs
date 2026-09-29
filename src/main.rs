@@ -69,6 +69,9 @@ enum Commands {
     Gc,
     #[cfg(feature = "serve-http")]
     ServeHttp(ServeHttpArgs),
+    /// Set a server password (read from stdin), stored as an Argon2 hash.
+    #[cfg(feature = "serve-http")]
+    Passwd(PasswdArgs),
 }
 
 #[derive(Args, Debug)]
@@ -301,6 +304,22 @@ struct ServeHttpArgs {
     /// Execute `.vcrs/hooks` scripts for commits received over HTTP.
     #[arg(long)]
     enable_hooks: bool,
+    /// Accept writes from unauthenticated clients (only relevant without
+    /// .vcrs/passwd.json).
+    #[arg(long)]
+    allow_anonymous_write: bool,
+    /// Serve plain HTTP on a non-loopback address (prefer a TLS reverse proxy).
+    #[arg(long)]
+    allow_insecure_http: bool,
+}
+
+#[cfg(feature = "serve-http")]
+#[derive(Args, Debug)]
+struct PasswdArgs {
+    /// Account to create or update in .vcrs/passwd.json.
+    user: String,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1136,6 +1155,37 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         #[cfg(feature = "serve-http")]
+        Commands::Passwd(args) => {
+            let mut password = String::new();
+            std::io::stdin().read_line(&mut password)?;
+            let password = password.trim_end_matches(['\r', '\n']);
+            if password.is_empty() {
+                return Err(VcsError::Protocol(
+                    "empty password (pipe it on stdin, e.g. `read -s P; echo \"$P\" | vcrs passwd alice`)".to_owned(),
+                ));
+            }
+            let client = Client::discover(&args.repo)?;
+            let path = client.root().join(".vcrs").join("passwd.json");
+            let mut doc: serde_json::Value = if path.exists() {
+                serde_json::from_slice(&std::fs::read(&path)?)?
+            } else {
+                json!({"users": {}})
+            };
+            let hash = version_control_rs::auth::hash_password(password)?;
+            doc["users"][&args.user] = serde_json::Value::String(hash);
+            std::fs::write(&path, serde_json::to_vec_pretty(&doc)?)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            if json_output {
+                print_json(json!({"ok": true, "command": "passwd", "user": args.user}))?;
+            } else {
+                println!("Password for '{}' stored in {}", args.user, path.display());
+            }
+        }
+        #[cfg(feature = "serve-http")]
         Commands::ServeHttp(args) => {
             let bind = format!("{}:{}", args.host, args.port);
             if json_output {
@@ -1156,6 +1206,8 @@ fn run(cli: Cli) -> Result<()> {
             }
             let options = version_control_rs::svn_http::ServeOptions {
                 enable_hooks: args.enable_hooks,
+                allow_anonymous_write: args.allow_anonymous_write,
+                allow_insecure_http: args.allow_insecure_http,
             };
             version_control_rs::svn_http::serve_http(args.repo, &bind, options)?;
         }

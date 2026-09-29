@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use uuid::Uuid;
 
+use crate::auth::{is_password_hash, verify_password};
 use crate::client::Client;
 use crate::error::{Result, VcsError};
 use crate::repo::{Repository, TreeEdits};
@@ -25,6 +26,8 @@ const MAX_ACTIVITIES: usize = 256;
 const MAX_ACTIVITY_BYTES: usize = 128 * 1024 * 1024;
 /// HTTP Basic auth realm advertised when a password file is configured.
 const AUTH_REALM: &str = "vcrs";
+/// Bound on remembered successful password checks (see `AppState::auth_cache`).
+const AUTH_CACHE_LIMIT: usize = 1024;
 
 /// Server behaviour switches (all default to the safe choice).
 #[derive(Debug, Clone, Default)]
@@ -32,6 +35,13 @@ pub struct ServeOptions {
     /// Run `.vcrs/hooks` scripts on commits received over HTTP. Off by default:
     /// hook execution on a network-facing server must be an explicit decision.
     pub enable_hooks: bool,
+    /// Without `.vcrs/passwd.json` every client is anonymous; writes are then
+    /// refused unless this is set.
+    pub allow_anonymous_write: bool,
+    /// Serve plain HTTP on a non-loopback address. Off by default: Basic
+    /// credentials and repository content would cross the network in clear
+    /// text — terminate TLS in a reverse proxy instead.
+    pub allow_insecure_http: bool,
 }
 
 #[derive(Debug)]
@@ -39,13 +49,19 @@ struct AppState {
     repo_root: PathBuf,
     options: ServeOptions,
     activities: Mutex<HashMap<String, TxnActivity>>,
-    /// Serializes commit application so overlapping MERGE requests cannot
-    /// interleave writes to the shared working copy.
+    /// Serializes commit application (the repository lock also does, across
+    /// processes).
     commit_lock: Mutex<()>,
+    /// Successful Basic-auth checks, keyed by a hash of user, password and the
+    /// stored hash: argon2 is deliberately slow, so it runs once per
+    /// credential rather than on every request. A changed passwd.json entry
+    /// changes the key.
+    auth_cache: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct TxnActivity {
+    /// Authenticated user that opened the activity; only they may use it.
     author: String,
     log_message: Option<String>,
     files: BTreeMap<String, Vec<u8>>,
@@ -55,24 +71,32 @@ struct TxnActivity {
     bases: BTreeMap<String, i64>,
 }
 
+impl TxnActivity {
+    fn touched_paths(&self) -> impl Iterator<Item = &String> {
+        self.files
+            .keys()
+            .chain(self.props.keys())
+            .chain(self.deletes.iter())
+    }
+}
+
+/// Who made a request.
+#[derive(Debug, Clone)]
+struct Identity {
+    name: String,
+    authenticated: bool,
+}
+
 pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Result<()> {
-    if !repo_root.join(".vcrs").exists() {
-        return Err(VcsError::RepositoryNotFound);
-    }
-    // authz keyed on a spoofable identity is meaningless without authentication.
-    // Refuse to start in that trap (authz.json present, passwd.json absent).
-    let vcrs = repo_root.join(".vcrs");
-    if vcrs.join("authz.json").exists() && !vcrs.join("passwd.json").exists() {
-        return Err(VcsError::ServerMisconfigured(
-            "authz.json requires passwd.json: authorization rules are unenforceable without authentication".to_owned(),
-        ));
-    }
+    validate_server_config(&repo_root)?;
+    check_bind_is_safe(bind, &options)?;
 
     let data = web::Data::new(AppState {
         repo_root,
         options,
         activities: Mutex::new(HashMap::new()),
         commit_lock: Mutex::new(()),
+        auth_cache: Mutex::new(HashSet::new()),
     });
 
     actix_web::rt::System::new()
@@ -92,22 +116,88 @@ pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Resu
         .map_err(VcsError::Io)
 }
 
+/// Refuse configurations that look protected but are not.
+fn validate_server_config(repo_root: &Path) -> Result<()> {
+    let vcrs = repo_root.join(".vcrs");
+    if !vcrs.exists() {
+        return Err(VcsError::RepositoryNotFound);
+    }
+    let passwd_path = vcrs.join("passwd.json");
+    // authz keyed on an unauthenticated identity is meaningless.
+    if vcrs.join("authz.json").exists() && !passwd_path.exists() {
+        return Err(VcsError::ServerMisconfigured(
+            "authz.json requires passwd.json: authorization rules are unenforceable without authentication".to_owned(),
+        ));
+    }
+    if passwd_path.exists() {
+        let passwd = load_passwd(&passwd_path)?;
+        if let Some(user) = passwd
+            .users
+            .iter()
+            .find(|(_, v)| !is_password_hash(v))
+            .map(|(u, _)| u)
+        {
+            return Err(VcsError::ServerMisconfigured(format!(
+                "passwd.json stores a plain-text password for '{user}'; replace it with a hash from `vcrs passwd {user}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Plain HTTP is only served on loopback unless explicitly allowed.
+fn check_bind_is_safe(bind: &str, options: &ServeOptions) -> Result<()> {
+    if options.allow_insecure_http {
+        return Ok(());
+    }
+    let host = bind.rsplit_once(':').map_or(bind, |(h, _)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback {
+        Ok(())
+    } else {
+        Err(VcsError::ServerMisconfigured(format!(
+            "refusing to serve plain HTTP on non-loopback address '{host}': credentials and content would travel unencrypted; bind to 127.0.0.1 behind a TLS reverse proxy or pass --allow-insecure-http"
+        )))
+    }
+}
+
 async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState>) -> HttpResponse {
     let method = req.method().as_str().to_owned();
     let path = req.path().to_owned();
 
-    // Authenticate before doing anything else. When a password file is present
-    // the request must carry valid Basic credentials; otherwise access is
-    // anonymous (the absence of the file is the operator's opt-in to open access).
-    let username = match authenticate(&state.repo_root, &req) {
-        Ok(user) => user,
+    // Authenticate before doing anything else.
+    let identity = match authenticate(&state, &req) {
+        Ok(identity) => identity,
         Err(resp) => return resp,
+    };
+    let user = identity.name.as_str();
+    let authz = match Authz::load(&state.repo_root) {
+        Ok(authz) => authz,
+        Err(err) => return svn_error_response(err),
     };
 
     if let Some(action) = method_action(&method) {
-        let authz_path = authz_check_path(&path);
-        if let Err(err) = authorize(&state.repo_root, &username, action, &authz_path) {
-            return svn_error_response(err);
+        if action == Action::Write
+            && !identity.authenticated
+            && !state.options.allow_anonymous_write
+        {
+            return HttpResponse::Forbidden().body(
+                "anonymous write access is disabled: configure .vcrs/passwd.json or start the server with --allow-anonymous-write",
+            );
+        }
+        // Coarse gate on the request URL; handlers below check the concrete
+        // repository paths (protocol URLs under /!svn carry them inside).
+        let allowed = if path == "/" || path.starts_with("/!svn") {
+            authz.allows_any(user, action)
+        } else {
+            authz.allows(user, action, &authz_check_path(&path))
+        };
+        if !allowed {
+            return svn_error_response(denied(user, &path, action));
         }
     }
 
@@ -143,13 +233,15 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         }
         "REPORT" => {
             let payload = String::from_utf8_lossy(&body);
+            // Reports only ever contain what the user may read.
             let xml = if payload.contains("get-latest-rev-report") {
                 latest_rev_report_xml(youngest)
             } else if payload.contains("log-report") {
-                log_report_response_xml(&state.repo_root).unwrap_or_else(|_| empty_report_xml())
+                log_report_response_xml(&state.repo_root, &authz, user)
+                    .unwrap_or_else(|_| empty_report_xml())
             } else if payload.contains("update-report") {
                 let from_rev = parse_update_target_rev(&body).unwrap_or(youngest);
-                update_report_xml(&state.repo_root, from_rev, youngest)
+                update_report_xml(&state.repo_root, from_rev, youngest, &authz, user)
                     .unwrap_or_else(|_| empty_report_xml())
             } else {
                 empty_report_xml()
@@ -164,13 +256,12 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         "MKACTIVITY" => {
             let id = Uuid::new_v4().to_string();
             let activity = TxnActivity {
-                author: username.clone(),
+                author: user.to_owned(),
                 ..TxnActivity::default()
             };
             if let Ok(mut map) = state.activities.lock() {
                 if map.len() >= MAX_ACTIVITIES {
-                    return HttpResponse::ServiceUnavailable()
-                        .body("too many open activities");
+                    return HttpResponse::ServiceUnavailable().body("too many open activities");
                 }
                 map.insert(id.clone(), activity);
             }
@@ -180,21 +271,29 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         }
         "CHECKOUT" => {
             let activity_href = parse_first_tag_text(&body, "href");
-            let Some(activity_id) = extract_activity_id(activity_href.as_deref().unwrap_or("")) else {
+            let Some(activity_id) = extract_activity_id(activity_href.as_deref().unwrap_or(""))
+            else {
                 return svn_error_response(VcsError::Protocol(
                     "missing activity-set href".to_owned(),
                 ));
             };
-            if let Ok(map) = state.activities.lock()
-                && !map.contains_key(&activity_id)
-            {
-                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
+            match state.activities.lock() {
+                Ok(map) => match map.get(&activity_id) {
+                    Some(a) if a.author == user => {}
+                    Some(_) => return foreign_activity(),
+                    None => {
+                        return svn_error_response(VcsError::Protocol(
+                            "unknown activity".to_owned(),
+                        ));
+                    }
+                },
+                Err(_) => return HttpResponse::InternalServerError().body("activity lock poisoned"),
             }
             HttpResponse::Created()
                 .insert_header(("Location", format!("/!svn/wrk/{activity_id}/")))
                 .finish()
         }
-        "PUT" => {
+        "PUT" | "PROPPATCH" | "DELETE" => {
             let Some((activity_id, rel_path)) = parse_wrk_path(&path) else {
                 return svn_error_response(VcsError::PathOutsideRepository(
                     "expected /!svn/wrk/<activity>/<path>".to_owned(),
@@ -204,119 +303,84 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                 Ok(v) => v,
                 Err(e) => return svn_error_response(e),
             };
+            if !authz.allows_rel(user, Action::Write, &rel) {
+                return svn_error_response(denied(user, &rel, Action::Write));
+            }
             let mut map = match state.activities.lock() {
                 Ok(m) => m,
-                Err(_) => {
-                    return HttpResponse::InternalServerError()
-                        .body("activity lock poisoned")
-                }
+                Err(_) => return HttpResponse::InternalServerError().body("activity lock poisoned"),
             };
             let Some(activity) = map.get_mut(&activity_id) else {
                 return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
             };
-
-            // Bound the memory a single activity can pin across PUTs. Compute
-            // the remaining budget up front so the svndiff expansion below is
-            // capped *before* it allocates (the declared target length is
-            // attacker-controlled).
-            let buffered: usize = activity
-                .files
-                .iter()
-                .filter(|(k, _)| *k != &rel)
-                .map(|(_, v)| v.len())
-                .sum();
-            let remaining = MAX_ACTIVITY_BYTES.saturating_sub(buffered);
-
-            let ctype = req
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default();
-            let data = if ctype.contains("svndiff") {
-                // The delta is relative to the client's base revision, not to
-                // whatever HEAD happens to be now.
-                let base_rev = *activity
-                    .bases
-                    .entry(rel.clone())
-                    .or_insert_with(|| request_base_rev(&req, youngest));
-                let base = load_file_bytes_at(&state.repo_root, &rel, base_rev).unwrap_or_default();
-                match apply_svndiff_stream(&base, &body, remaining) {
-                    Ok(v) => v,
-                    Err(err) => return svn_error_response(err),
-                }
-            } else {
-                body.to_vec()
-            };
-            if data.len() > remaining {
-                return HttpResponse::PayloadTooLarge().body("activity byte limit exceeded");
+            if activity.author != user {
+                return foreign_activity();
             }
-            // A PUT supersedes a pending delete for the same path (SVN replace).
-            activity.deletes.remove(&rel);
-            activity
+            let base_rev = *activity
                 .bases
                 .entry(rel.clone())
                 .or_insert_with(|| request_base_rev(&req, youngest));
-            activity.files.insert(rel, data);
-            HttpResponse::Created().finish()
-        }
-        "PROPPATCH" => {
-            let Some((activity_id, rel_path)) = parse_wrk_path(&path) else {
-                return svn_error_response(VcsError::PathOutsideRepository(
-                    "expected /!svn/wrk/<activity>/<path>".to_owned(),
-                ));
-            };
-            let rel = match sanitize_repo_rel(rel_path) {
-                Ok(v) => v,
-                Err(e) => return svn_error_response(e),
-            };
-            let ops = parse_proppatch(&body);
-            let mut map = match state.activities.lock() {
-                Ok(m) => m,
-                Err(_) => {
-                    return HttpResponse::InternalServerError()
-                        .body("activity lock poisoned")
+            match method.as_str() {
+                "PUT" => put_into_activity(&req, &body, &state.repo_root, activity, rel, base_rev),
+                "PROPPATCH" => {
+                    // Setting properties supersedes a pending delete.
+                    activity.deletes.remove(&rel);
+                    let entry = activity.props.entry(rel).or_default();
+                    for (k, v) in parse_proppatch(&body) {
+                        entry.insert(k, v);
+                    }
+                    HttpResponse::build(StatusCode::MULTI_STATUS)
+                        .insert_header((header::CONTENT_TYPE, "text/xml; charset=\"utf-8\""))
+                        .body(
+                            r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:status>HTTP/1.1 200 OK</D:status></D:response></D:multistatus>"#,
+                        )
                 }
-            };
-            let Some(activity) = map.get_mut(&activity_id) else {
-                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
-            };
-            // Setting properties supersedes a pending delete for the same path.
-            activity.deletes.remove(&rel);
-            activity
-                .bases
-                .entry(rel.clone())
-                .or_insert_with(|| request_base_rev(&req, youngest));
-            let entry = activity.props.entry(rel).or_default();
-            for (k, v) in ops {
-                entry.insert(k, v);
+                _ => {
+                    // A delete supersedes any pending PUT/PROPPATCH.
+                    activity.files.remove(&rel);
+                    activity.props.remove(&rel);
+                    activity.deletes.insert(rel);
+                    HttpResponse::NoContent().finish()
+                }
             }
-            HttpResponse::build(StatusCode::MULTI_STATUS)
-                .insert_header((header::CONTENT_TYPE, "text/xml; charset=\"utf-8\""))
-                .body(
-                    r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:"><D:response><D:status>HTTP/1.1 200 OK</D:status></D:response></D:multistatus>"#,
-                )
         }
         "MERGE" => {
             let activity_href = parse_first_tag_text(&body, "href");
-            let Some(activity_id) = extract_activity_id(activity_href.as_deref().unwrap_or("")) else {
+            let Some(activity_id) = extract_activity_id(activity_href.as_deref().unwrap_or(""))
+            else {
                 return svn_error_response(VcsError::Protocol("missing source href".to_owned()));
             };
-            let log_msg = parse_first_tag_text(&body, "log-message")
-                .or_else(|| req.headers().get("SVN-Log").and_then(|v| v.to_str().ok()).map(str::to_owned));
+            let log_msg = parse_first_tag_text(&body, "log-message").or_else(|| {
+                req.headers()
+                    .get("SVN-Log")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            });
             let activity = {
                 let mut map = match state.activities.lock() {
                     Ok(m) => m,
                     Err(_) => {
-                        return HttpResponse::InternalServerError().body("activity lock poisoned")
+                        return HttpResponse::InternalServerError().body("activity lock poisoned");
                     }
                 };
-                map.remove(&activity_id)
+                match map.get(&activity_id) {
+                    Some(a) if a.author != user => return foreign_activity(),
+                    Some(_) => map.remove(&activity_id),
+                    None => None,
+                }
             };
             let Some(activity) = activity else {
                 return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
             };
+            // Re-check every path at commit time (rules may have changed).
+            if let Some(path) = activity
+                .touched_paths()
+                .find(|p| !authz.allows_rel(user, Action::Write, p))
+            {
+                return svn_error_response(denied(user, path, Action::Write));
+            }
             // Apply the commit on a blocking thread, serialized against other
-            // commits so concurrent MERGEs cannot interleave working-copy writes.
+            // commits.
             let state = state.clone();
             let repo_root = state.repo_root.clone();
             let hooks = state.options.enable_hooks;
@@ -334,91 +398,36 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                     .insert_header(("SVN-Youngest-Rev", rev.to_string()))
                     .body(merge_ok_xml(rev)),
                 Ok(Err(err)) => svn_error_response(err),
-                Err(_) => {
-                    HttpResponse::InternalServerError().body("commit task canceled")
-                }
+                Err(_) => HttpResponse::InternalServerError().body("commit task canceled"),
             }
         }
-        "DELETE" => {
-            let Some((activity_id, rel_path)) = parse_wrk_path(&path) else {
-                return svn_error_response(VcsError::PathOutsideRepository(
-                    "expected /!svn/wrk/<activity>/<path>".to_owned(),
-                ));
-            };
-            let rel = match sanitize_repo_rel(rel_path) {
-                Ok(v) => v,
-                Err(e) => return svn_error_response(e),
-            };
-            let mut map = match state.activities.lock() {
-                Ok(m) => m,
-                Err(_) => {
-                    return HttpResponse::InternalServerError().body("activity lock poisoned")
-                }
-            };
-            let Some(activity) = map.get_mut(&activity_id) else {
-                return svn_error_response(VcsError::Protocol("unknown activity".to_owned()));
-            };
-            // A delete supersedes any pending PUT/PROPPATCH for the same path.
-            activity.files.remove(&rel);
-            activity.props.remove(&rel);
-            activity
-                .bases
-                .entry(rel.clone())
-                .or_insert_with(|| request_base_rev(&req, youngest));
-            activity.deletes.insert(rel);
-            HttpResponse::NoContent().finish()
-        }
-        "LOCK" => {
+        "LOCK" | "UNLOCK" => {
             let rel = match sanitize_repo_rel(path.trim_start_matches('/')) {
                 Ok(v) => v,
                 Err(e) => return svn_error_response(e),
             };
-            let lock_path = state.repo_root.join(".vcrs").join("locks.json");
-            let mut locks = match load_locks(&lock_path) {
-                Ok(v) => v,
+            if !authz.allows_rel(user, Action::Write, &rel) {
+                return svn_error_response(denied(user, &rel, Action::Write));
+            }
+            // Repository-level locks live in SQLite: acquisition is atomic,
+            // and commits by anyone else are refused while the lock is held.
+            let repo = match Repository::discover(&state.repo_root) {
+                Ok(r) => r,
                 Err(e) => return svn_error_response(e),
             };
-            if let Some(owner) = locks.get(&rel)
-                && owner != &username
-            {
-                return svn_error_response(VcsError::LockConflict {
-                    path: rel,
-                    owner: owner.clone(),
-                });
+            if method == "UNLOCK" {
+                return match repo.unlock_path(&rel, user) {
+                    Ok(()) => HttpResponse::NoContent().finish(),
+                    Err(e) => svn_error_response(e),
+                };
             }
-            locks.insert(rel.clone(), username.clone());
-            if let Err(e) = save_locks(&lock_path, &locks) {
-                return svn_error_response(e);
+            match repo.lock_path(&rel, user) {
+                Ok(lock) => HttpResponse::Ok()
+                    .insert_header((header::CONTENT_TYPE, "text/xml; charset=\"utf-8\""))
+                    .insert_header(("Lock-Token", format!("<{}>", lock.token)))
+                    .body(lock_ok_xml(&rel, &lock.token, user)),
+                Err(e) => svn_error_response(e),
             }
-            let token = format!("opaquelocktoken:vcrs:{}:{}", username, rel);
-            HttpResponse::Ok()
-                .insert_header((header::CONTENT_TYPE, "text/xml; charset=\"utf-8\""))
-                .insert_header(("Lock-Token", format!("<{token}>")))
-                .body(lock_ok_xml(&rel, &token, &username))
-        }
-        "UNLOCK" => {
-            let rel = match sanitize_repo_rel(path.trim_start_matches('/')) {
-                Ok(v) => v,
-                Err(e) => return svn_error_response(e),
-            };
-            let lock_path = state.repo_root.join(".vcrs").join("locks.json");
-            let mut locks = match load_locks(&lock_path) {
-                Ok(v) => v,
-                Err(e) => return svn_error_response(e),
-            };
-            if let Some(owner) = locks.get(&rel)
-                && owner != &username
-            {
-                return svn_error_response(VcsError::LockConflict {
-                    path: rel,
-                    owner: owner.clone(),
-                });
-            }
-            locks.remove(&rel);
-            if let Err(e) = save_locks(&lock_path, &locks) {
-                return svn_error_response(e);
-            }
-            HttpResponse::NoContent().finish()
         }
         "GET" | "HEAD" => {
             if let Some((rev, rel_path)) = parse_versioned_get_path(&path) {
@@ -426,6 +435,9 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
                     Ok(v) => v,
                     Err(_) => return HttpResponse::BadRequest().body("invalid path"),
                 };
+                if !authz.allows_rel(user, Action::Read, &rel) {
+                    return svn_error_response(denied(user, &rel, Action::Read));
+                }
                 let client = match Client::discover(&state.repo_root) {
                     Ok(c) => c,
                     Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
@@ -452,6 +464,64 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
         _ => HttpResponse::build(StatusCode::METHOD_NOT_ALLOWED)
             .insert_header((header::CONTENT_TYPE, "text/plain; charset=\"utf-8\""))
             .body("method not allowed"),
+    }
+}
+
+/// Buffer a PUT into its activity (full text, or an svndiff against the
+/// client's base revision of the file).
+fn put_into_activity(
+    req: &HttpRequest,
+    body: &[u8],
+    repo_root: &Path,
+    activity: &mut TxnActivity,
+    rel: String,
+    base_rev: i64,
+) -> HttpResponse {
+    // Bound the memory a single activity can pin across PUTs. Compute the
+    // remaining budget up front so the svndiff expansion below is capped
+    // *before* it allocates (the declared target length is attacker-controlled).
+    let buffered: usize = activity
+        .files
+        .iter()
+        .filter(|(k, _)| **k != rel)
+        .map(|(_, v)| v.len())
+        .sum();
+    let remaining = MAX_ACTIVITY_BYTES.saturating_sub(buffered);
+
+    let ctype = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let data = if ctype.contains("svndiff") {
+        // The delta is relative to the client's base revision, not to
+        // whatever HEAD happens to be now.
+        let base = load_file_bytes_at(repo_root, &rel, base_rev).unwrap_or_default();
+        match apply_svndiff_stream(&base, body, remaining) {
+            Ok(v) => v,
+            Err(err) => return svn_error_response(err),
+        }
+    } else {
+        body.to_vec()
+    };
+    if data.len() > remaining {
+        return HttpResponse::PayloadTooLarge().body("activity byte limit exceeded");
+    }
+    // A PUT supersedes a pending delete for the same path (SVN replace).
+    activity.deletes.remove(&rel);
+    activity.files.insert(rel, data);
+    HttpResponse::Created().finish()
+}
+
+fn foreign_activity() -> HttpResponse {
+    HttpResponse::Forbidden().body("activity belongs to another user")
+}
+
+fn denied(user: &str, path: &str, action: Action) -> VcsError {
+    VcsError::AuthzDenied {
+        user: user.to_owned(),
+        path: path.to_owned(),
+        action: action.as_str().to_owned(),
     }
 }
 
@@ -501,27 +571,24 @@ fn authz_check_path(req_path: &str) -> String {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct PasswdFile {
-    /// Map of username -> password (svnserve-style plaintext passwd file).
+    /// Map of username -> Argon2 password hash (created by `vcrs passwd`).
     #[serde(default)]
     users: BTreeMap<String, String>,
 }
 
-/// Resolve the request's authenticated username. If `.vcrs/passwd.json` exists,
-/// valid HTTP Basic credentials are required and the Basic username is used
-/// (the spoofable `SVN-UserName` header is ignored). Without a passwd file,
-/// access is anonymous.
-fn authenticate(repo_root: &Path, req: &HttpRequest) -> std::result::Result<String, HttpResponse> {
-    let passwd_path = repo_root.join(".vcrs").join("passwd.json");
+/// Resolve the request's identity. With `.vcrs/passwd.json`, valid HTTP Basic
+/// credentials are required. Without it every request is anonymous: the
+/// client-supplied `SVN-UserName` header is never trusted as an identity.
+fn authenticate(
+    state: &AppState,
+    req: &HttpRequest,
+) -> std::result::Result<Identity, HttpResponse> {
+    let passwd_path = state.repo_root.join(".vcrs").join("passwd.json");
     if !passwd_path.exists() {
-        let user = req
-            .headers()
-            .get("SVN-UserName")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("anonymous")
-            .to_owned();
-        return Ok(user);
+        return Ok(Identity {
+            name: "anonymous".to_owned(),
+            authenticated: false,
+        });
     }
 
     let passwd = match load_passwd(&passwd_path) {
@@ -531,10 +598,36 @@ fn authenticate(repo_root: &Path, req: &HttpRequest) -> std::result::Result<Stri
     let Some((user, pass)) = parse_basic_auth(req) else {
         return Err(auth_challenge());
     };
-    match passwd.users.get(&user) {
-        Some(expected) if constant_time_eq(expected.as_bytes(), pass.as_bytes()) => Ok(user),
-        _ => Err(auth_challenge()),
+    let Some(stored) = passwd.users.get(&user) else {
+        return Err(auth_challenge());
+    };
+    let key = {
+        let mut h = blake3::Hasher::new();
+        for part in [user.as_str(), pass.as_str(), stored.as_str()] {
+            h.update(part.as_bytes());
+            h.update(b"\0");
+        }
+        h.finalize().to_hex().to_string()
+    };
+    let cached = state
+        .auth_cache
+        .lock()
+        .is_ok_and(|cache| cache.contains(&key));
+    if !cached {
+        if !verify_password(stored, &pass) {
+            return Err(auth_challenge());
+        }
+        if let Ok(mut cache) = state.auth_cache.lock() {
+            if cache.len() >= AUTH_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(key);
+        }
     }
+    Ok(Identity {
+        name: user,
+        authenticated: true,
+    })
 }
 
 fn auth_challenge() -> HttpResponse {
@@ -561,22 +654,19 @@ fn load_passwd(path: &Path) -> Result<PasswdFile> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// Length-aware constant-time byte comparison for password checks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Read,
     Write,
+}
+
+impl Action {
+    fn as_str(self) -> &'static str {
+        match self {
+            Action::Read => "read",
+            Action::Write => "write",
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -593,38 +683,59 @@ struct AuthzRules {
     write: Vec<String>,
 }
 
-fn authorize(repo_root: &Path, user: &str, action: Action, path: &str) -> Result<()> {
-    let authz_path = repo_root.join(".vcrs").join("authz.json");
-    if !authz_path.exists() {
-        return Ok(());
+impl AuthzRules {
+    fn for_action(&self, action: Action) -> &[String] {
+        match action {
+            Action::Read => &self.read,
+            Action::Write => &self.write,
+        }
     }
-    let bytes = fs::read(authz_path)?;
-    let authz: AuthzFile = serde_json::from_slice(&bytes)?;
-    let Some(rules) = authz.users.get(user) else {
-        return Err(VcsError::AuthzDenied {
-            user: user.to_owned(),
-            path: path.to_owned(),
-            action: match action {
-                Action::Read => "read".to_owned(),
-                Action::Write => "write".to_owned(),
-            },
-        });
-    };
-    let allow = match action {
-        Action::Read => is_allowed(&rules.read, path),
-        Action::Write => is_allowed(&rules.write, path),
-    };
-    if allow {
-        Ok(())
-    } else {
-        Err(VcsError::AuthzDenied {
-            user: user.to_owned(),
-            path: path.to_owned(),
-            action: match action {
-                Action::Read => "read".to_owned(),
-                Action::Write => "write".to_owned(),
-            },
+}
+
+/// Path-prefix access rules from `.vcrs/authz.json` (`/` or `/dir` entries per
+/// user and action). Without the file everything is allowed.
+#[derive(Debug, Default)]
+struct Authz {
+    rules: Option<AuthzFile>,
+}
+
+impl Authz {
+    fn load(repo_root: &Path) -> Result<Self> {
+        let path = repo_root.join(".vcrs").join("authz.json");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Ok(Self {
+            rules: Some(serde_json::from_slice(&fs::read(path)?)?),
         })
+    }
+
+    /// `path` is an absolute repository path (`/dir/file`).
+    fn allows(&self, user: &str, action: Action, path: &str) -> bool {
+        match &self.rules {
+            None => true,
+            Some(file) => file
+                .users
+                .get(user)
+                .is_some_and(|r| is_allowed(r.for_action(action), path)),
+        }
+    }
+
+    /// `rel` is a repository-relative path (`dir/file`).
+    fn allows_rel(&self, user: &str, action: Action, rel: &str) -> bool {
+        self.allows(user, action, &format!("/{rel}"))
+    }
+
+    /// Whether the user has any rule for `action` (gate for protocol URLs
+    /// whose concrete paths are checked later).
+    fn allows_any(&self, user: &str, action: Action) -> bool {
+        match &self.rules {
+            None => true,
+            Some(file) => file
+                .users
+                .get(user)
+                .is_some_and(|r| !r.for_action(action).is_empty()),
+        }
     }
 }
 
@@ -632,19 +743,6 @@ fn is_allowed(prefixes: &[String], path: &str) -> bool {
     prefixes
         .iter()
         .any(|p| p == "/" || path == p || path.starts_with(&format!("{p}/")))
-}
-
-fn load_locks(path: &Path) -> Result<BTreeMap<String, String>> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let bytes = fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn save_locks(path: &Path, locks: &BTreeMap<String, String>) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(locks)?)?;
-    Ok(())
 }
 
 fn sanitize_repo_rel(input: &str) -> Result<String> {
@@ -1128,7 +1226,13 @@ fn latest_rev_report_xml(youngest: i64) -> String {
     )
 }
 
-fn update_report_xml(repo_root: &Path, from_rev: i64, youngest: i64) -> Result<String> {
+fn update_report_xml(
+    repo_root: &Path,
+    from_rev: i64,
+    youngest: i64,
+    authz: &Authz,
+    user: &str,
+) -> Result<String> {
     let client = Client::discover(repo_root)?;
     if from_rev >= youngest {
         return Ok(format!(
@@ -1144,6 +1248,10 @@ fn update_report_xml(repo_root: &Path, from_rev: i64, youngest: i64) -> Result<S
             Err(_) => continue,
         };
         for cp in changed {
+            // Paths the user may not read are never sent.
+            if !authz.allows_rel(user, Action::Read, &cp.path) {
+                continue;
+            }
             match cp.action {
                 ChangedPathAction::Delete => {
                     entries.push_str(&format!(
@@ -1193,11 +1301,21 @@ fn update_report_xml(repo_root: &Path, from_rev: i64, youngest: i64) -> Result<S
     ))
 }
 
-fn log_report_response_xml(repo_root: &Path) -> Result<String> {
+fn log_report_response_xml(repo_root: &Path, authz: &Authz, user: &str) -> Result<String> {
     let client = Client::discover(repo_root)?;
     let commits = client.log(20)?;
     let mut items = String::new();
+    let reads_root = authz.allows(user, Action::Read, "/");
     for c in commits {
+        // A revision is listed only if the user may read something it changed.
+        if !reads_root
+            && !c
+                .changed_paths
+                .iter()
+                .any(|cp| authz.allows_rel(user, Action::Read, &cp.path))
+        {
+            continue;
+        }
         items.push_str(&format!(
             r#"<S:log-item><D:version-name>{}</D:version-name><D:creator-displayname>{}</D:creator-displayname><S:date>{}</S:date><D:comment>{}</D:comment></S:log-item>"#,
             c.revision,
@@ -1558,9 +1676,59 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_behaves() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(!constant_time_eq(b"secret", b"Secret"));
-        assert!(!constant_time_eq(b"secret", b"secre"));
+    fn plain_http_is_loopback_only_unless_allowed() {
+        let safe = ServeOptions::default();
+        for ok in ["127.0.0.1:3690", "localhost:80", "[::1]:3690"] {
+            assert!(check_bind_is_safe(ok, &safe).is_ok(), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0:3690",
+            "10.0.0.5:80",
+            "example.org:3690",
+            "[::]:3690",
+        ] {
+            assert!(check_bind_is_safe(bad, &safe).is_err(), "{bad}");
+        }
+        let insecure = ServeOptions {
+            allow_insecure_http: true,
+            ..ServeOptions::default()
+        };
+        assert!(check_bind_is_safe("0.0.0.0:3690", &insecure).is_ok());
+    }
+
+    #[test]
+    fn plain_text_passwords_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        Client::init(dir.path()).unwrap();
+        let passwd = dir.path().join(".vcrs/passwd.json");
+        fs::write(&passwd, r#"{"users":{"alice":"secret"}}"#).unwrap();
+        assert!(validate_server_config(dir.path()).is_err());
+        let hash = crate::auth::hash_password("secret").unwrap();
+        fs::write(
+            &passwd,
+            serde_json::json!({"users": {"alice": hash}}).to_string(),
+        )
+        .unwrap();
+        assert!(validate_server_config(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn authz_is_checked_per_path() {
+        let authz = Authz {
+            rules: Some(
+                serde_json::from_str(
+                    r#"{"users":{"alice":{"read":["/pub"],"write":["/pub/docs"]}}}"#,
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(authz.allows_rel("alice", Action::Read, "pub/a.txt"));
+        assert!(!authz.allows_rel("alice", Action::Read, "secret/a.txt"));
+        assert!(!authz.allows_rel("alice", Action::Read, "public/a.txt"));
+        assert!(authz.allows_rel("alice", Action::Write, "pub/docs/x"));
+        assert!(!authz.allows_rel("alice", Action::Write, "pub/x"));
+        assert!(authz.allows_any("alice", Action::Write));
+        assert!(!authz.allows_any("bob", Action::Read));
+        assert!(Authz::default().allows_rel("anyone", Action::Write, "x"));
     }
 }
