@@ -1,4 +1,7 @@
+mod lock;
 mod storage;
+
+pub use lock::RepoLock;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -84,6 +87,7 @@ impl Repository {
     }
 
     pub fn ensure_initialized(&self) -> Result<()> {
+        let _lock = self.lock()?;
         storage::ensure_layout(self)?;
         let wcdb = self.wcdb()?;
         let _ = wcdb.max_revision()?;
@@ -95,6 +99,12 @@ impl Repository {
             self.sync_wcdb()?;
         }
         Ok(())
+    }
+
+    /// Take the exclusive repository lock (re-entrant on the current thread).
+    /// Held by every mutating operation and by crash recovery.
+    pub fn lock(&self) -> Result<RepoLock> {
+        RepoLock::acquire(&self.root)
     }
 
     /// Enable or disable execution of repository hook scripts.
@@ -113,6 +123,7 @@ impl Repository {
     }
 
     pub fn set_head_commit_id(&self, commit_id: &str) -> Result<()> {
+        let _lock = self.lock()?;
         storage::write_head(self, commit_id)
     }
 
@@ -141,6 +152,7 @@ impl Repository {
     }
 
     pub fn rebuild_revision_index(&self) -> Result<()> {
+        let _lock = self.lock()?;
         let commits_dir = self.root.join(VCRS_DIR).join("commits");
         if !commits_dir.exists() {
             return Ok(());
@@ -180,12 +192,14 @@ impl Repository {
     }
 
     pub fn write_blob(&self, content: &[u8]) -> Result<String> {
+        let _lock = self.lock()?;
         storage::write_blob(self, content)
     }
 
     /// Sweep blobs in the object store that no commit references. Not safe to
     /// run concurrently with a commit in progress.
     pub fn gc(&self) -> Result<GcStats> {
+        let _lock = self.lock()?;
         let commits_dir = self.root.join(VCRS_DIR).join("commits");
         let mut referenced: BTreeSet<String> = BTreeSet::new();
         if commits_dir.exists() {
@@ -436,6 +450,7 @@ impl Repository {
         author: &str,
         revprops: BTreeMap<String, String>,
     ) -> Result<Commit> {
+        let _lock = self.lock()?;
         self.ensure_initialized()?;
         let snapshot = self.materialize_working_copy()?;
         self.commit_entries(snapshot, message, author, revprops)
@@ -671,6 +686,7 @@ impl Repository {
         message: &str,
         author: &str,
     ) -> Result<Commit> {
+        let _lock = self.lock()?;
         self.ensure_initialized()?;
         let head_files = self.head_commit()?.map(|c| c.files).unwrap_or_default();
         let mut result: BTreeMap<String, FileEntry> = head_files
@@ -758,6 +774,7 @@ impl Repository {
     }
 
     pub fn status(&self) -> Result<Vec<FileChange>> {
+        let _lock = self.lock()?;
         // Single working-copy scan that both refreshes wc.db and returns the
         // change set (the old path scanned the tree twice).
         let working = self.snapshot_working_copy()?;
@@ -765,6 +782,7 @@ impl Repository {
     }
 
     pub fn revert_to_head(&self, only_paths: &[String]) -> Result<Vec<FileChange>> {
+        let _lock = self.lock()?;
         let Some(head) = self.head_commit()? else {
             return Ok(Vec::new());
         };
@@ -775,6 +793,7 @@ impl Repository {
     }
 
     pub fn copy_path(&self, src: &str, dst: &str) -> Result<()> {
+        let _lock = self.lock()?;
         let src_abs = self.abs_path(src)?;
         let dst_abs = self.abs_path(dst)?;
         if let Some(parent) = dst_abs.parent() {
@@ -785,6 +804,7 @@ impl Repository {
     }
 
     pub fn move_path(&self, src: &str, dst: &str) -> Result<()> {
+        let _lock = self.lock()?;
         let src_abs = self.abs_path(src)?;
         let dst_abs = self.abs_path(dst)?;
         if let Some(parent) = dst_abs.parent() {
@@ -803,6 +823,7 @@ impl Repository {
         revision: &str,
         depth: Option<Depth>,
     ) -> Result<Vec<FileChange>> {
+        let _lock = self.lock()?;
         if let Some(d) = depth {
             self.set_depth(d)?;
             self.wcdb()?.set_ambient_depth("", depth_to_str(d), true)?;
@@ -961,6 +982,7 @@ impl Repository {
         dry_run: bool,
         record_only: bool,
     ) -> Result<MergeOutcome> {
+        let _lock = self.lock()?;
         let (scope_path, target_rev) = self.resolve_peg_spec(revision)?;
         let target = self.read_commit_by_revision(target_rev)?;
 
@@ -1068,6 +1090,7 @@ impl Repository {
     }
 
     pub fn set_property(&self, path: &str, name: &str, value: &str) -> Result<()> {
+        let _lock = self.lock()?;
         let wcdb = self.wcdb()?;
         wcdb.set_file_prop(path, name, value)?;
         let abs = self.abs_path(path)?;
@@ -1092,6 +1115,7 @@ impl Repository {
     }
 
     pub fn set_inherited_property(&self, scope_path: &str, name: &str, value: &str) -> Result<()> {
+        let _lock = self.lock()?;
         self.wcdb()?.set_inherited_prop(scope_path, name, value)
     }
 
@@ -1100,6 +1124,7 @@ impl Repository {
     }
 
     pub fn set_changelist(&self, path: &str, changelist: Option<&str>) -> Result<()> {
+        let _lock = self.lock()?;
         self.wcdb()?.set_changelist(path, changelist)
     }
 
@@ -1108,6 +1133,7 @@ impl Repository {
     }
 
     pub fn set_depth(&self, depth: Depth) -> Result<()> {
+        let _lock = self.lock()?;
         self.wcdb()?.set_depth(depth_to_str(depth))
     }
 
@@ -1121,6 +1147,7 @@ impl Repository {
     }
 
     pub fn del_property(&self, path: &str, name: &str) -> Result<()> {
+        let _lock = self.lock()?;
         let wcdb = self.wcdb()?;
         wcdb.delete_file_prop(path, name)?;
         let abs = self.abs_path(path)?;
@@ -1141,6 +1168,7 @@ impl Repository {
         token: Option<&str>,
         owner: Option<&str>,
     ) -> Result<()> {
+        let _lock = self.lock()?;
         let wcdb = self.wcdb()?;
         match token {
             Some(t) => wcdb.set_lock_token(path, t, owner)?,
@@ -1156,6 +1184,7 @@ impl Repository {
     }
 
     pub fn clear_local_lock_tokens(&self) -> Result<()> {
+        let _lock = self.lock()?;
         self.wcdb()?.clear_all_lock_tokens()
     }
 
@@ -1174,6 +1203,7 @@ impl Repository {
     }
 
     pub fn add_ignore(&self, pattern: &str) -> Result<()> {
+        let _lock = self.lock()?;
         self.wcdb()?.add_ignore_rule("", pattern, false)
     }
 
@@ -1187,6 +1217,7 @@ impl Repository {
         target_url: &str,
         revision: Option<String>,
     ) -> Result<()> {
+        let _lock = self.lock()?;
         self.wcdb()?.set_external(&ExternalDef {
             path: path.to_owned(),
             target_url: target_url.to_owned(),
@@ -1481,7 +1512,6 @@ impl Repository {
         let mut planned: Vec<FileChange> = Vec::new();
 
         if !dry_run {
-            wcdb.acquire_lock("", i64::MAX)?;
             wcdb.clear_conflicts()?;
         }
 
@@ -1582,7 +1612,6 @@ impl Repository {
             });
         }
 
-        wcdb.release_lock("")?;
         let changed = self.status()?;
         if conflicts.is_empty() && advance_base {
             wcdb.set_base_revision(rev)?;

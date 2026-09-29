@@ -371,24 +371,6 @@ impl WcDb {
         })
     }
 
-    pub fn acquire_lock(&self, path: &str, levels: i64) -> Result<()> {
-        self.with_write_tx(|tx| {
-            tx.execute(
-                "INSERT INTO wc_lock(path, locked_levels) VALUES(?1, ?2)
-                 ON CONFLICT(path) DO UPDATE SET locked_levels=excluded.locked_levels",
-                params![path, levels],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn release_lock(&self, path: &str) -> Result<()> {
-        self.with_write_tx(|tx| {
-            tx.execute("DELETE FROM wc_lock WHERE path=?1", params![path])?;
-            Ok(())
-        })
-    }
-
     pub fn enqueue_work(&self, work_json: &str) -> Result<i64> {
         self.with_write_tx(|tx| {
             tx.execute(

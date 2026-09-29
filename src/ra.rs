@@ -145,6 +145,8 @@ impl RaSession for FileRaSession {
         self.authorize(Action::Read, "/")?;
         let local = Repository::discover(wc_root)?;
         let remote = Repository::discover(&self.remote_root)?;
+        let _local_lock = local.lock()?;
+        let _remote_lock = remote.lock()?;
 
         copy_store(&remote.root, &local.root)?;
         if let Some(head) = remote.head_commit_id()? {
@@ -160,6 +162,10 @@ impl RaSession for FileRaSession {
         self.authorize(Action::Write, "/")?;
         let local = Repository::discover(wc_root)?;
         let remote = Repository::discover(&self.remote_root)?;
+        // Holding the remote lock across the ancestry check and the HEAD update
+        // makes the push a compare-and-swap: no other push can slip in between.
+        let _local_lock = local.lock()?;
+        let _remote_lock = remote.lock()?;
 
         let Some(local_head) = local.head_commit_id()? else {
             return Ok(());

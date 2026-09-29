@@ -262,3 +262,34 @@ fn hooks_can_be_disabled() {
     let client = client.with_hooks(false);
     assert_eq!(client.commit("r1", "a").unwrap().revision, 1);
 }
+
+#[test]
+fn concurrent_commits_are_serialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    Client::init(&root).unwrap();
+    let workers: Vec<_> = (0..4)
+        .map(|t| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let client = Client::discover(&root).unwrap();
+                for i in 0..5 {
+                    write(&root, &format!("t{t}/f{i}.txt"), &format!("{t}-{i}\n"));
+                    client.commit(&format!("t{t} c{i}"), "a").unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+
+    let client = Client::discover(&root).unwrap();
+    let log = client.log(1000).unwrap();
+    let head = log.first().unwrap().revision;
+    assert_eq!(log.len() as i64, head, "history must be a gap-free chain");
+    for (i, c) in log.iter().rev().enumerate() {
+        assert_eq!(c.revision, i as i64 + 1);
+    }
+    assert!(client.status().unwrap().is_empty());
+}

@@ -87,6 +87,7 @@ impl Client {
     }
 
     pub fn commit_and_push(&self, message: &str, author: &str) -> Result<Commit> {
+        let _lock = self.repo.lock()?;
         let commit = self.repo.commit(message, author)?;
         if let Some(cfg) = self.remote_config()? {
             let ra = FileRaSession::from_url(&cfg.url, cfg.username.as_deref())?;
@@ -96,6 +97,7 @@ impl Client {
     }
 
     pub fn staged_paths(&self) -> Result<Vec<String>> {
+        let _lock = self.repo.lock()?;
         let changed = self.status_path_set()?;
         let mut idx = self.load_stage_index()?;
         idx.retain_changed(&changed);
@@ -113,6 +115,7 @@ impl Client {
     }
 
     pub fn stage_all(&self) -> Result<Vec<String>> {
+        let _lock = self.repo.lock()?;
         let mut idx = self.load_stage_index()?;
         idx.staged_files = self.status_path_set()?;
         idx.staged_hunks.clear();
@@ -121,11 +124,13 @@ impl Client {
     }
 
     pub fn clear_staging(&self) -> Result<()> {
+        let _lock = self.repo.lock()?;
         self.save_stage_index(&StageIndex::default())?;
         Ok(())
     }
 
     pub fn stage_paths(&self, paths: &[String]) -> Result<Vec<String>> {
+        let _lock = self.repo.lock()?;
         let allowed = self.status_path_set()?;
         let mut idx = self.load_stage_index()?;
         for path in paths {
@@ -140,6 +145,7 @@ impl Client {
     }
 
     pub fn unstage_paths(&self, paths: &[String]) -> Result<Vec<String>> {
+        let _lock = self.repo.lock()?;
         let mut idx = self.load_stage_index()?;
         for path in paths {
             let norm = normalize_rel(path);
@@ -179,6 +185,7 @@ impl Client {
     }
 
     pub fn stage_hunks(&self, path: &str, indices: &[usize]) -> Result<Vec<usize>> {
+        let _lock = self.repo.lock()?;
         let norm = normalize_rel(path);
         let hunks = self.hunks(&norm)?;
         let max = hunks.len();
@@ -203,6 +210,7 @@ impl Client {
     }
 
     pub fn unstage_hunks(&self, path: &str, indices: &[usize]) -> Result<Vec<usize>> {
+        let _lock = self.repo.lock()?;
         let norm = normalize_rel(path);
         let mut idx = self.load_stage_index()?;
         let mut remove_entry = false;
@@ -225,6 +233,7 @@ impl Client {
     }
 
     pub fn commit_staged(&self, message: &str, author: &str, push: bool) -> Result<Commit> {
+        let _lock = self.repo.lock()?;
         let status = self.status()?;
         if status.is_empty() {
             return Err(VcsError::NoStagedChanges);
