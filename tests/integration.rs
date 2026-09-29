@@ -637,3 +637,74 @@ fn reverse_range_merge_undoes_a_revision() {
     assert_eq!(st[0].path, "g.txt");
     assert_eq!(st[0].kind, ChangeKind::Deleted);
 }
+
+#[test]
+fn inherited_properties_are_not_baked_into_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    client
+        .set_inherited_property("", "team:owner", "platform")
+        .unwrap();
+    write(root, "a.txt", "a\n");
+    add(&client, &["a.txt"]);
+    let c1 = client.commit("r1", "a").unwrap();
+    let entry = c1.files.iter().find(|f| f.path == "a.txt").unwrap();
+    assert!(!entry.props.contains_key("team:owner"), "{:?}", entry.props);
+    assert_eq!(client.get_property("a.txt", "team:owner").unwrap(), None);
+    assert!(client.status().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn clearing_the_executable_bit_removes_the_property() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "run.sh", "#!/bin/sh\n");
+    fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    add(&client, &["run.sh"]);
+    let c1 = client.commit("r1", "a").unwrap();
+    assert!(c1.files[0].props.contains_key("svn:executable"));
+
+    fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+    let st = client.status().unwrap();
+    assert_eq!(st.len(), 1);
+    assert!(st[0].props_modified);
+    let c2 = client.commit("r2", "a").unwrap();
+    assert!(!c2.files[0].props.contains_key("svn:executable"));
+    assert!(!c2.files[0].executable);
+}
+
+#[test]
+fn update_applies_and_merges_property_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    write(root, "f.txt", "1\n");
+    add(&client, &["f.txt"]);
+    client.commit("r1", "a").unwrap();
+    client.set_property("f.txt", "x:review", "done").unwrap();
+    write(root, "f.txt", "2\n");
+    client.commit("r2", "a").unwrap();
+
+    client.update_to_revision("1").unwrap();
+    assert_eq!(client.get_property("f.txt", "x:review").unwrap(), None);
+    client.set_property("f.txt", "x:local", "yes").unwrap();
+    client.update_to_revision("HEAD").unwrap();
+
+    assert!(client.conflicts().unwrap().is_empty());
+    assert_eq!(read(root, "f.txt"), "2\n");
+    assert_eq!(
+        client.get_property("f.txt", "x:review").unwrap().as_deref(),
+        Some("done")
+    );
+    assert_eq!(
+        client.get_property("f.txt", "x:local").unwrap().as_deref(),
+        Some("yes")
+    );
+    let st = client.status().unwrap();
+    assert_eq!(st.len(), 1);
+    assert!(st[0].props_modified && !st[0].text_modified);
+}

@@ -104,6 +104,7 @@ impl Repository {
         storage::ensure_layout(self)?;
         let wcdb = self.wcdb()?;
         self.migrate_legacy_layout()?;
+        self.migrate_explicit_props(&wcdb)?;
         self.process_work_queue()?;
         if self.head_commit_id()?.is_none() {
             wcdb.set_base_revision(0)?;
@@ -496,6 +497,7 @@ impl Repository {
     ) -> Result<FileEntry> {
         let (bytes, props, is_binary) =
             repo_form(raw, is_symlink, file_props, inherited, executable);
+        let executable = has_svn_prop(&props, "svn:executable");
         let blob_id = if persist {
             self.write_blob(&bytes)?
         } else {
@@ -888,14 +890,18 @@ impl Repository {
                     fs::create_dir_all(parent)?;
                 }
                 let blob = self.read_blob(&entry.blob_id)?;
+                let inherited = wcdb.inherited_props_for_path(&ch.path)?;
                 write_entry_to_working(
                     &abs,
                     entry,
                     &blob,
-                    base_commit.as_ref().map(|c| c.revision),
-                    base_commit.as_ref().map(|c| c.author.as_str()),
-                    base_commit.as_ref().map(|c| c.created_at),
-                    wcdb.has_lock_token(&ch.path)?,
+                    &CheckoutMeta {
+                        revision: base_commit.as_ref().map(|c| c.revision),
+                        author: base_commit.as_ref().map(|c| c.author.as_str()),
+                        date: base_commit.as_ref().map(|c| c.created_at),
+                        has_lock_token: wcdb.has_lock_token(&ch.path)?,
+                        inherited: &inherited,
+                    },
                 )?;
                 wcdb.replace_props_for_path(&ch.path, &entry.props)?;
             }
@@ -1343,9 +1349,16 @@ impl Repository {
         Ok(Depth::from_str(&self.wcdb()?.depth()?).unwrap_or(Depth::Infinity))
     }
 
+    /// A property of the working file: explicit properties plus those that
+    /// mirror the file itself (`svn:executable`, `svn:special`). Inherited
+    /// properties are not node properties and are listed by `iprop-list`.
     pub fn get_property(&self, path: &str, name: &str) -> Result<Option<String>> {
-        let wcdb = self.wcdb()?;
-        Ok(wcdb.file_props(path)?.remove(name))
+        if let Ok(abs) = self.abs_path(path)
+            && fs::symlink_metadata(&abs).is_ok_and(|m| !m.is_dir())
+        {
+            return Ok(self.working_entry(path, None, false)?.props.remove(name));
+        }
+        Ok(self.wcdb()?.file_props(path)?.remove(name))
     }
 
     pub fn del_property(&self, path: &str, name: &str) -> Result<()> {
@@ -1498,6 +1511,23 @@ impl Repository {
             fs::remove_dir_all(transactions)?;
         }
         Ok(())
+    }
+
+    /// Before 0.3 the node-property table was rewritten from the effective
+    /// properties on every status, so it accumulated inherited and inferred
+    /// values that could then never be removed. Reset it once to the BASE
+    /// properties (keeping those of scheduled additions).
+    fn migrate_explicit_props(&self, wcdb: &WcDb) -> Result<()> {
+        if wcdb.meta_value("props_model")?.as_deref() == Some("explicit") {
+            return Ok(());
+        }
+        let base = self.base_files(wcdb)?;
+        let schedule = wcdb.schedule()?;
+        for f in &base {
+            wcdb.replace_props_for_path(&f.path, &f.props)?;
+        }
+        wcdb.retain_file_props(&versioned_paths(&base, &schedule))?;
+        wcdb.set_meta_value("props_model", "explicit")
     }
 
     /// Rebuild the revision index (revisions + merge edges) from the parent
@@ -1722,18 +1752,26 @@ impl Repository {
                         fs::create_dir_all(parent)?;
                     }
                     let raw = self.read_blob(&te.blob_id)?;
+                    let inherited = wcdb.inherited_props_for_path(path)?;
                     write_entry_to_working(
                         &abs,
                         te,
                         &raw,
-                        target_meta.as_ref().map(|c| c.revision),
-                        target_meta.as_ref().map(|c| c.author.as_str()),
-                        target_meta.as_ref().map(|c| c.created_at),
-                        wcdb.has_lock_token(path)?,
+                        &CheckoutMeta {
+                            revision: target_meta.as_ref().map(|c| c.revision),
+                            author: target_meta.as_ref().map(|c| c.author.as_str()),
+                            date: target_meta.as_ref().map(|c| c.created_at),
+                            has_lock_token: wcdb.has_lock_token(path)?,
+                            inherited: &inherited,
+                        },
                     )?;
+                    // Local properties were unmodified (or already equal), so
+                    // the incoming ones become the working properties.
+                    wcdb.replace_props_for_path(path, &te.props)?;
                 }
                 None => {
                     remove_path_if_exists(&self.abs_path(path)?)?;
+                    wcdb.replace_props_for_path(path, &BTreeMap::new())?;
                 }
             }
         }
@@ -1776,12 +1814,23 @@ impl Repository {
     ) -> Result<bool> {
         let abs = self.abs_path(path)?;
         match (w, t) {
-            (Some(we), Some(te)) if we.blob_id == te.blob_id => {
-                // Same content, different properties on both sides.
-                wcdb.set_tree_conflict(path, "property conflict")?;
-                Ok(false)
-            }
             (Some(we), Some(te)) => {
+                // Properties merge key by key, independently of the content.
+                let empty = BTreeMap::new();
+                let (props, prop_conflicts) =
+                    merge_props(b.map_or(&empty, |x| &x.props), &we.props, &te.props);
+                wcdb.replace_props_for_path(path, &props)?;
+                let prop_conflict = !prop_conflicts.is_empty();
+                if prop_conflict {
+                    wcdb.set_tree_conflict(
+                        path,
+                        &format!("property conflict: {}", prop_conflicts.join(", ")),
+                    )?;
+                }
+                if we.blob_id == te.blob_id {
+                    sync_executable_bit(&abs, &props)?;
+                    return Ok(!prop_conflict);
+                }
                 let base = match b {
                     Some(be) => self.read_blob(&be.blob_id)?,
                     None => Vec::new(),
@@ -1800,11 +1849,13 @@ impl Repository {
                     if clean {
                         remove_path_if_exists(&abs)?;
                         fs::write(&abs, merged.as_bytes())?;
-                        return Ok(true);
+                        sync_executable_bit(&abs, &props)?;
+                        return Ok(!prop_conflict);
                     }
                     self.write_conflict_artifacts(path, &abs, &base, &mine, &theirs)?;
                     remove_path_if_exists(&abs)?;
                     fs::write(&abs, merged.as_bytes())?;
+                    sync_executable_bit(&abs, &props)?;
                 } else {
                     // Binary: the working file keeps the local version.
                     self.write_conflict_artifacts(path, &abs, &base, &mine, &theirs)?;
@@ -1932,7 +1983,9 @@ impl Repository {
         apply_scheduled_copies(&mut changes, &schedule);
         mark_conflicts(&mut changes, &wcdb.conflicts()?);
         wcdb.replace_nodes(&base_files, working, &changes)?;
-        wcdb.replace_file_props_from_entries(working)?;
+        // Explicit properties are owned by prop-set/update/revert; only drop
+        // the ones of paths that left version control.
+        wcdb.retain_file_props(&versioned_paths(&self.base_files(&wcdb)?, &schedule))?;
         Ok(changes)
     }
 
@@ -2410,8 +2463,14 @@ fn resolve_inherited(
 }
 
 /// Apply repository-form normalization (eol, keyword contraction, symlink/binary
-/// handling) to raw working bytes, returning the normalized bytes, the effective
+/// handling) to raw working bytes, returning the normalized bytes, the node
 /// property set, and whether the content is treated as binary.
+///
+/// Node properties are the explicit ones, except that `svn:executable` and
+/// `svn:special` mirror the file itself (on Unix, where the filesystem can
+/// express them): `chmod -x` removes `svn:executable`, replacing a symlink by
+/// a file removes `svn:special`. Inherited properties steer normalization but
+/// are never recorded on the node.
 fn repo_form(
     mut raw: Vec<u8>,
     is_symlink: bool,
@@ -2420,33 +2479,89 @@ fn repo_form(
     executable: bool,
 ) -> (Vec<u8>, BTreeMap<String, String>, bool) {
     let detected_binary = is_binary_content(&raw);
-    let mut props = infer_props(executable);
+    let mut props = file_props.clone();
+    if cfg!(unix) {
+        if executable {
+            props.insert("svn:executable".to_owned(), "*".to_owned());
+        } else {
+            props.remove("svn:executable");
+        }
+    }
     if is_symlink {
         props.insert("svn:special".to_owned(), "*".to_owned());
+    } else if cfg!(unix) {
+        props.remove("svn:special");
     }
-    for (k, v) in file_props {
-        props.insert(k.clone(), v.clone());
-    }
-    for (k, v) in inherited {
-        props.entry(k.clone()).or_insert_with(|| v.clone());
-    }
-    let is_binary = effective_is_binary(detected_binary, &props);
-    // Only normalize line endings when svn:eol-style is explicitly set; without
-    // it, content is stored byte-for-byte (svn semantics).
+    let effective = with_inherited(&props, inherited);
+    let is_binary = effective_is_binary(detected_binary, &effective);
+    // Only normalize line endings when svn:eol-style is set; without it,
+    // content is stored byte-for-byte (svn semantics).
     if !is_binary
-        && !has_svn_prop(&props, "svn:special")
-        && has_svn_prop(&props, "svn:eol-style")
+        && !has_svn_prop(&effective, "svn:special")
+        && has_svn_prop(&effective, "svn:eol-style")
         && let Ok(text) = std::str::from_utf8(&raw)
     {
-        raw = normalize_eol(text, props.get("svn:eol-style")).into_bytes();
+        raw = normalize_eol(text, effective.get("svn:eol-style")).into_bytes();
     }
-    if has_svn_prop(&props, "svn:keywords")
-        && !has_svn_prop(&props, "svn:special")
+    if has_svn_prop(&effective, "svn:keywords")
+        && !has_svn_prop(&effective, "svn:special")
         && let Ok(text) = std::str::from_utf8(&raw)
     {
-        raw = contract_keywords(text, &props).into_bytes();
+        raw = contract_keywords(text, &effective).into_bytes();
     }
     (raw, props, is_binary)
+}
+
+/// Node properties overlaid with inherited ones (node properties win).
+fn with_inherited(
+    props: &BTreeMap<String, String>,
+    inherited: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = props.clone();
+    for (k, v) in inherited {
+        out.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    out
+}
+
+/// Three-way merge of property maps, key by key. Returns the merged map and
+/// the keys changed differently on both sides (the local value is kept).
+fn merge_props(
+    base: &BTreeMap<String, String>,
+    mine: &BTreeMap<String, String>,
+    theirs: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let keys: BTreeSet<&String> = base
+        .keys()
+        .chain(mine.keys())
+        .chain(theirs.keys())
+        .collect();
+    let mut merged = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for key in keys {
+        let (b, m, t) = (base.get(key), mine.get(key), theirs.get(key));
+        let value = if m == t || t == b {
+            m
+        } else if m == b {
+            t
+        } else {
+            conflicts.push(key.clone());
+            m
+        };
+        if let Some(v) = value {
+            merged.insert(key.clone(), v.clone());
+        }
+    }
+    (merged, conflicts)
+}
+
+/// Make the executable bit of a (non-symlink) working file match its
+/// `svn:executable` property.
+fn sync_executable_bit(abs: &Path, props: &BTreeMap<String, String>) -> Result<()> {
+    if fs::symlink_metadata(abs).is_ok_and(|m| m.is_file()) {
+        set_executable_if_supported(abs, has_svn_prop(props, "svn:executable"))?;
+    }
+    Ok(())
 }
 
 /// Heuristic detection of unresolved SVN conflict markers in committed content.
@@ -2491,65 +2606,60 @@ fn is_binary_content(bytes: &[u8]) -> bool {
     }
 }
 
-/// Auto-derived svn properties. Only `svn:executable` is inferred (matching
-/// svn's add-time behavior); eol-style / mime-type are NOT auto-injected — they
-/// pollute every file's property set and cannot then be removed (the snapshot
-/// would re-add them). Normalization is driven by explicit/inherited props only.
-fn infer_props(executable: bool) -> BTreeMap<String, String> {
-    let mut props = BTreeMap::new();
-    if executable {
-        props.insert("svn:executable".to_owned(), "*".to_owned());
-    }
-    props
-}
-
 fn has_svn_prop(props: &BTreeMap<String, String>, name: &str) -> bool {
     props.get(name).is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Revision metadata and working-copy state needed to materialize a file.
+struct CheckoutMeta<'a> {
+    revision: Option<i64>,
+    author: Option<&'a str>,
+    date: Option<DateTime<Utc>>,
+    has_lock_token: bool,
+    /// Inherited properties of the path (normalization only).
+    inherited: &'a BTreeMap<String, String>,
 }
 
 fn write_entry_to_working(
     abs: &Path,
     entry: &FileEntry,
     raw: &[u8],
-    revision: Option<i64>,
-    author: Option<&str>,
-    date: Option<DateTime<Utc>>,
-    has_lock_token: bool,
+    meta: &CheckoutMeta<'_>,
 ) -> Result<()> {
     remove_path_if_exists(abs)?;
-    if has_svn_prop(&entry.props, "svn:special")
+    let props = with_inherited(&entry.props, meta.inherited);
+    if has_svn_prop(&props, "svn:special")
         && let Ok(text) = std::str::from_utf8(raw)
         && let Some(target) = text.strip_prefix("link ")
+        && try_create_symlink(abs, target.trim()).is_ok()
     {
-        if try_create_symlink(abs, target.trim()).is_ok() {
-            return Ok(());
-        }
+        return Ok(());
     }
 
     let mut out = raw.to_vec();
-    let effective_binary = effective_is_binary(entry.is_binary, &entry.props);
+    let effective_binary = effective_is_binary(entry.is_binary, &props);
     if !effective_binary
-        && !has_svn_prop(&entry.props, "svn:special")
-        && has_svn_prop(&entry.props, "svn:eol-style")
+        && !has_svn_prop(&props, "svn:special")
+        && has_svn_prop(&props, "svn:eol-style")
         && let Ok(text) = std::str::from_utf8(&out)
     {
-        out = apply_eol_style_for_working(text, entry.props.get("svn:eol-style")).into_bytes();
+        out = apply_eol_style_for_working(text, props.get("svn:eol-style")).into_bytes();
     }
-    if has_svn_prop(&entry.props, "svn:keywords")
+    if has_svn_prop(&props, "svn:keywords")
         && let Ok(text) = std::str::from_utf8(&out)
     {
         out = expand_keywords(
             text,
-            &entry.props,
-            revision.unwrap_or(0),
-            author.unwrap_or("unknown"),
-            date.unwrap_or_else(Utc::now),
+            &props,
+            meta.revision.unwrap_or(0),
+            meta.author.unwrap_or("unknown"),
+            meta.date.unwrap_or_else(Utc::now),
         )
         .into_bytes();
     }
     fs::write(abs, out)?;
     set_executable_if_supported(abs, entry.executable)?;
-    if has_svn_prop(&entry.props, "svn:needs-lock") && !has_lock_token {
+    if has_svn_prop(&props, "svn:needs-lock") && !meta.has_lock_token {
         set_readonly_if_supported(abs, true)?;
     }
     Ok(())

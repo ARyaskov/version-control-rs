@@ -539,19 +539,27 @@ impl WcDb {
         })
     }
 
-    pub fn replace_file_props_from_entries(&self, entries: &[FileEntry]) -> Result<()> {
-        let tx = self.begin_write()?;
-        tx.execute("DELETE FROM file_props", [])?;
-        for e in entries {
-            for (name, value) in &e.props {
-                tx.execute(
-                    "INSERT INTO file_props(path, name, value) VALUES(?1,?2,?3)",
-                    params![e.path, name, value],
-                )?;
+    /// Drop the properties of every path not in `keep`.
+    pub fn retain_file_props(&self, keep: &std::collections::BTreeSet<String>) -> Result<()> {
+        let paths: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT DISTINCT path FROM file_props")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        self.with_write_tx(|tx| {
+            for path in paths.iter().filter(|p| !keep.contains(*p)) {
+                tx.execute("DELETE FROM file_props WHERE path=?1", params![path])?;
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
+    }
+
+    pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        self.meta(key)
+    }
+
+    pub fn set_meta_value(&self, key: &str, value: &str) -> Result<()> {
+        self.set_meta(key, value)
     }
 
     /// Replace all properties of one path (e.g. when reverting to BASE).
