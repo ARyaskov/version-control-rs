@@ -254,4 +254,24 @@ mod tests {
             "$Rev$ and $Rev$"
         );
     }
+
+    proptest::proptest! {
+        #[test]
+        fn keyword_contraction_is_stable(text in "[aRev$: \n]{0,60}") {
+            let mut props = BTreeMap::new();
+            props.insert("svn:keywords".to_owned(), "Rev Author Id".to_owned());
+            let once = contract_keywords(&text, &props);
+            proptest::prop_assert_eq!(&contract_keywords(&once, &props), &once);
+            let date = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+            let expanded = expand_keywords(&once, &props, 7, "alice", date);
+            proptest::prop_assert_eq!(&contract_keywords(&expanded, &props), &once);
+        }
+
+        #[test]
+        fn eol_normalization_is_idempotent(text in "[ab\r\n]{0,40}", style in "(LF|CRLF|CR|native)") {
+            let style = Some(&style);
+            let once = normalize_eol(&text, style);
+            proptest::prop_assert_eq!(&normalize_eol(&once, style), &once);
+        }
+    }
 }

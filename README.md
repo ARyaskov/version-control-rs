@@ -217,6 +217,18 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
 - Repositories written by 0.2 (uncompressed objects, full manifests in
   commits, `HEAD` file) are read and migrated transparently.
 
+## Testing
+
+```bash
+cargo test                           # unit, property (proptest) and integration tests
+cargo test --no-default-features     # without the HTTP server
+cargo +nightly fuzz run svndiff      # fuzz targets: svndiff, dav_xml, request_path (needs cargo-fuzz)
+```
+
+Integration tests drive the library and the `vcrs` binary in temporary
+repositories; the HTTP server is tested end to end through its request
+handler (authentication, authorization, commits, limits).
+
 ## License 
 
 Apache 2.0

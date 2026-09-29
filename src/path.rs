@@ -229,4 +229,18 @@ mod tests {
         assert_eq!(user_path_to_rel(root, Path::new("/repo"), ".").unwrap(), "");
         assert!(user_path_to_rel(root, Path::new("/repo"), "../outside").is_err());
     }
+
+    proptest::proptest! {
+        #[test]
+        fn valid_paths_never_leave_the_root(input in "[a-zA-Z.:/\\\\~ -]{0,24}") {
+            if validate_rel_path(&input).is_ok() {
+                let joined = Path::new("/root").join(&input);
+                proptest::prop_assert!(joined.starts_with("/root"));
+                proptest::prop_assert!(joined
+                    .components()
+                    .skip(2)
+                    .all(|c| matches!(c, Component::Normal(_))));
+            }
+        }
+    }
 }

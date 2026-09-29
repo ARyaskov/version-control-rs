@@ -43,3 +43,40 @@ pub fn merge_props(
     }
     (merged, conflicts)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn text() -> impl Strategy<Value = String> {
+        proptest::collection::vec("[abc]{0,3}\n", 0..6).prop_map(|lines| lines.concat())
+    }
+
+    proptest! {
+        #[test]
+        fn one_sided_changes_merge_cleanly(base in text(), other in text()) {
+            prop_assert_eq!(three_way_text(&base, &other, &base), (other.clone(), true));
+            prop_assert_eq!(three_way_text(&base, &base, &other), (other, true));
+        }
+    }
+
+    #[test]
+    fn property_maps_merge_key_by_key() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let base = map(&[("a", "1"), ("b", "1")]);
+        let mine = map(&[("a", "2"), ("b", "1")]);
+        let theirs = map(&[("a", "1"), ("b", "3"), ("c", "new")]);
+        let (merged, conflicts) = merge_props(&base, &mine, &theirs);
+        assert_eq!(merged, map(&[("a", "2"), ("b", "3"), ("c", "new")]));
+        assert!(conflicts.is_empty());
+        let (_, conflicts) = merge_props(&base, &map(&[("a", "x")]), &map(&[("a", "y")]));
+        // "a" changed differently on both sides; "b" was removed on both.
+        assert_eq!(conflicts, vec!["a".to_owned()]);
+    }
+}

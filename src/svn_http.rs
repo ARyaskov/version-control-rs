@@ -111,18 +111,8 @@ struct Identity {
 }
 
 pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Result<()> {
-    validate_server_config(&repo_root)?;
     check_bind_is_safe(bind, &options)?;
-
-    let client = Client::discover(&repo_root)?;
-    let data = web::Data::new(AppState {
-        repo_root,
-        client,
-        options,
-        activities: Mutex::new(HashMap::new()),
-        commit_lock: Mutex::new(()),
-        auth_cache: Mutex::new(HashSet::new()),
-    });
+    let data = app_state(repo_root, options)?;
 
     actix_web::rt::System::new()
         .block_on(async move {
@@ -136,6 +126,20 @@ pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Resu
             .await
         })
         .map_err(VcsError::Io)
+}
+
+/// Validate the configuration and open the repository once.
+fn app_state(repo_root: PathBuf, options: ServeOptions) -> Result<web::Data<AppState>> {
+    validate_server_config(&repo_root)?;
+    let client = Client::discover(&repo_root)?;
+    Ok(web::Data::new(AppState {
+        repo_root,
+        client,
+        options,
+        activities: Mutex::new(HashMap::new()),
+        commit_lock: Mutex::new(()),
+        auth_cache: Mutex::new(HashSet::new()),
+    }))
 }
 
 /// Refuse configurations that look protected but are not.
@@ -1496,6 +1500,37 @@ fn svn_error_response(err: VcsError) -> HttpResponse {
         .body(xml)
 }
 
+/// Entry points for the fuzz targets in `fuzz/` (not a stable API).
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzz_entry {
+    /// Decode an svndiff stream against a base taken from the input: must
+    /// never panic or allocate beyond the budget.
+    pub fn svndiff(data: &[u8]) {
+        let rest = data.get(1..).unwrap_or_default();
+        let split = usize::from(data.first().copied().unwrap_or(0)).min(rest.len());
+        let (base, stream) = rest.split_at(split);
+        let _ = super::apply_svndiff_stream(base, stream, 1 << 20);
+    }
+
+    /// Parse request bodies with every XML parser: must never panic.
+    pub fn xml(data: &[u8]) {
+        let _ = super::parse_proppatch(data);
+        let _ = super::parse_update_target_rev(data);
+        let _ = super::parse_first_tag_text(data, "href");
+    }
+
+    /// Whatever the request-path sanitizer accepts must be a valid,
+    /// non-reserved repository path.
+    pub fn request_path(data: &[u8]) {
+        if let Ok(input) = std::str::from_utf8(data)
+            && let Ok(rel) = super::sanitize_repo_rel(input)
+        {
+            assert!(crate::path::validate_rel_path(&rel).is_ok(), "{rel:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1835,5 +1870,298 @@ mod tests {
         assert!(authz.allows_any("alice", Action::Write));
         assert!(!authz.allows_any("bob", Action::Read));
         assert!(Authz::default().allows_rel("anyone", Action::Write, "x"));
+    }
+
+    /// End-to-end requests through the real handler.
+    mod http {
+        use super::*;
+        use actix_web::http::Method;
+        use actix_web::test;
+
+        fn method(m: &str) -> Method {
+            Method::from_bytes(m.as_bytes()).unwrap()
+        }
+
+        fn basic(user: &str, pass: &str) -> (header::HeaderName, String) {
+            let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+            (header::AUTHORIZATION, format!("Basic {token}"))
+        }
+
+        fn repo_with_file() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            let client = Client::init(dir.path()).unwrap();
+            fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+            client.add(&["a.txt".to_owned()]).unwrap();
+            client.commit("r1", "local").unwrap();
+            dir
+        }
+
+        macro_rules! service {
+            ($state:expr) => {
+                test::init_service(
+                    App::new()
+                        .app_data($state.clone())
+                        .route("/{tail:.*}", web::to(svn_entry)),
+                )
+                .await
+            };
+        }
+
+        #[actix_web::test]
+        async fn anonymous_writes_are_refused_by_default_but_reads_work() {
+            let dir = repo_with_file();
+            let state = app_state(dir.path().to_path_buf(), ServeOptions::default()).unwrap();
+            let app = service!(state);
+            let req = test::TestRequest::default()
+                .method(method("MKACTIVITY"))
+                .uri("/!svn/act/x")
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::FORBIDDEN
+            );
+
+            let req = test::TestRequest::get()
+                .uri("/!svn/bc/1/a.txt")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(test::read_body(resp).await, "a\n");
+        }
+
+        #[actix_web::test]
+        async fn commit_round_trip_leaves_the_server_working_copy_alone() {
+            let dir = repo_with_file();
+            let options = ServeOptions {
+                allow_anonymous_write: true,
+                ..ServeOptions::default()
+            };
+            let state = app_state(dir.path().to_path_buf(), options).unwrap();
+            let app = service!(state);
+
+            let req = test::TestRequest::default()
+                .method(method("MKACTIVITY"))
+                .uri("/!svn/act/new")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let activity = resp
+                .headers()
+                .get("Location")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let id = activity.rsplit('/').next().unwrap().to_owned();
+
+            let checkout = format!(
+                r#"<D:checkout xmlns:D="DAV:"><D:activity-set><D:href>{activity}</D:href></D:activity-set></D:checkout>"#
+            );
+            let req = test::TestRequest::default()
+                .method(method("CHECKOUT"))
+                .uri("/!svn/ver/1/a.txt")
+                .set_payload(checkout)
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::CREATED
+            );
+
+            let req = test::TestRequest::put()
+                .uri(&format!("/!svn/wrk/{id}/docs/new.txt"))
+                .insert_header(("X-SVN-Version-Name", "1"))
+                .set_payload("hello\n")
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::CREATED
+            );
+
+            let merge = format!(
+                r#"<D:merge xmlns:D="DAV:"><D:source><D:href>{activity}</D:href></D:source></D:merge>"#
+            );
+            let req = test::TestRequest::default()
+                .method(method("MERGE"))
+                .uri("/")
+                .set_payload(merge)
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get("SVN-Youngest-Rev").unwrap(), "2");
+
+            let req = test::TestRequest::get()
+                .uri("/!svn/bc/2/docs/new.txt")
+                .to_request();
+            assert_eq!(
+                test::read_body(test::call_service(&app, req).await).await,
+                "hello\n"
+            );
+            assert!(!dir.path().join("docs/new.txt").exists());
+        }
+
+        #[actix_web::test]
+        async fn authentication_and_path_authorization_are_enforced() {
+            let dir = repo_with_file();
+            let vcrs = dir.path().join(".vcrs");
+            let users = serde_json::json!({"users": {
+                "alice": crate::auth::hash_password("wonderland").unwrap(),
+                "bob": crate::auth::hash_password("builder").unwrap(),
+            }});
+            fs::write(vcrs.join("passwd.json"), users.to_string()).unwrap();
+            fs::write(
+                vcrs.join("authz.json"),
+                r#"{"users":{"alice":{"read":["/"],"write":["/docs"]},"bob":{"read":["/docs"],"write":["/docs"]}}}"#,
+            )
+            .unwrap();
+            let state = app_state(dir.path().to_path_buf(), ServeOptions::default()).unwrap();
+            let app = service!(state);
+
+            let req = test::TestRequest::default()
+                .method(Method::OPTIONS)
+                .uri("/")
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let req = test::TestRequest::default()
+                .method(Method::OPTIONS)
+                .uri("/")
+                .insert_header(basic("alice", "wrong"))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+
+            let req = test::TestRequest::default()
+                .method(method("MKACTIVITY"))
+                .uri("/!svn/act/a")
+                .insert_header(basic("alice", "wonderland"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let activity = resp
+                .headers()
+                .get("Location")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let id = activity.rsplit('/').next().unwrap().to_owned();
+
+            // Outside alice's writable prefix.
+            let req = test::TestRequest::put()
+                .uri(&format!("/!svn/wrk/{id}/src/x.rs"))
+                .insert_header(basic("alice", "wonderland"))
+                .set_payload("x")
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::FORBIDDEN
+            );
+            // Inside it.
+            let req = test::TestRequest::put()
+                .uri(&format!("/!svn/wrk/{id}/docs/x.md"))
+                .insert_header(basic("alice", "wonderland"))
+                .set_payload("x")
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::CREATED
+            );
+            // Bob may write /docs but not through alice's activity.
+            let req = test::TestRequest::put()
+                .uri(&format!("/!svn/wrk/{id}/docs/y.md"))
+                .insert_header(basic("bob", "builder"))
+                .set_payload("y")
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::FORBIDDEN
+            );
+            // Bob cannot read outside /docs.
+            let req = test::TestRequest::get()
+                .uri("/!svn/bc/1/a.txt")
+                .insert_header(basic("bob", "builder"))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        #[actix_web::test]
+        async fn oversized_request_bodies_are_rejected() {
+            let dir = repo_with_file();
+            let state = app_state(dir.path().to_path_buf(), ServeOptions::default()).unwrap();
+            let app = service!(state);
+            let req = test::TestRequest::default()
+                .method(method("PROPFIND"))
+                .uri("/")
+                .set_payload(vec![b'x'; MAX_REQUEST_BYTES + 1])
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+    }
+
+    /// Property tests: parsers of untrusted input never panic, and what the
+    /// sanitizer accepts is always a safe repository path.
+    mod properties {
+        use super::*;
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn svndiff_full_text_roundtrips(data in vec(any::<u8>(), 0..4096)) {
+                let encoded = encode_svndiff_full(&data);
+                prop_assert_eq!(apply_svndiff_stream(&[], &encoded, 1 << 20).unwrap(), data);
+            }
+
+            #[test]
+            fn svndiff_decoder_never_panics(
+                base in vec(any::<u8>(), 0..256),
+                body in vec(any::<u8>(), 0..512),
+                version in 0u8..2,
+            ) {
+                let mut stream = vec![b'S', b'V', b'N', version];
+                stream.extend(body);
+                let _ = apply_svndiff_stream(&base, &stream, 1 << 16);
+            }
+
+            #[test]
+            fn xml_parsers_never_panic(data in vec(any::<u8>(), 0..512)) {
+                let _ = parse_proppatch(&data);
+                let _ = parse_update_target_rev(&data);
+                let _ = parse_first_tag_text(&data, "href");
+            }
+
+            #[test]
+            fn sanitized_paths_are_safe(input in "[a-zA-Z0-9./%:~ \\\\-]{0,40}") {
+                if let Ok(rel) = sanitize_repo_rel(&input) {
+                    prop_assert!(crate::path::validate_rel_path(&rel).is_ok());
+                    prop_assert!(rel.split('/').all(|c| c != ".." && c != "."
+                        && !crate::path::is_reserved_component(c)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_entry_points_accept_arbitrary_input() {
+        for input in [
+            &b""[..],
+            b"\x03SVN\0\x00\x00\x05\x01\x01\x81x",
+            b"<a><href>x",
+            b"../%2e%2e/.VCRS/x",
+        ] {
+            fuzz_entry::svndiff(input);
+            fuzz_entry::xml(input);
+            fuzz_entry::request_path(input);
+        }
     }
 }

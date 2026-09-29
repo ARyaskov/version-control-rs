@@ -28,6 +28,8 @@ default = ["serve-http"]
 # The HTTP/WebDAV server and its heavy async/XML/compression stack. Disable with
 # `--no-default-features` for a much smaller, faster-to-build CLI/library.
 serve-http = ["dep:actix-web", "dep:quick-xml", "dep:uuid", "dep:flate2", "dep:argon2", "dep:password-hash"]
+# Hidden entry points for the fuzz targets in fuzz/ (not a stable API).
+fuzzing = ["serve-http"]
 
 [dependencies]
 actix-web = { version = "4.11", optional = true }
@@ -52,4 +54,5 @@ globset = "0.4"
 flate2 = { version = "1.0", optional = true }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"

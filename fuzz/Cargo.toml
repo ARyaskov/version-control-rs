@@ -1,0 +1,37 @@
+[package]
+name = "version-control-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+version-control-rs = { path = "..", features = ["fuzzing"] }
+
+# Not part of the main crate's build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "svndiff"
+path = "fuzz_targets/svndiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dav_xml"
+path = "fuzz_targets/dav_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_path"
+path = "fuzz_targets/request_path.rs"
+test = false
+doc = false
+bench = false
