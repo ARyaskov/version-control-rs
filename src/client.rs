@@ -8,7 +8,7 @@ use crate::diff::unified_diff;
 use crate::error::{Result, VcsError};
 use crate::path::safe_join;
 use crate::ra::{FileRaSession, RaSession, RemoteConfig};
-use crate::repo::{GcStats, MergeOutcome, Repository, ResolveAccept};
+use crate::repo::{GcStats, MergeOutcome, PullOutcome, Repository, ResolveAccept};
 use crate::types::{
     BlameLine, ChangeKind, ChangedPath, Commit, Depth, DiffHunk, FileChange, FileEntry,
     RevisionRange,
@@ -617,12 +617,14 @@ impl Client {
         FileRaSession::load_config(&self.repo.root)
     }
 
-    pub fn switch_remote(&self, url: &str, username: Option<&str>) -> Result<()> {
+    pub fn switch_remote(&self, url: &str, username: Option<&str>) -> Result<PullOutcome> {
         self.set_remote(url, username)?;
         self.pull_remote()
     }
 
-    pub fn pull_remote(&self) -> Result<()> {
+    /// Fetch the remote history and bring the working copy to its HEAD.
+    /// Unpushed local commits are replayed on top of the remote history.
+    pub fn pull_remote(&self) -> Result<PullOutcome> {
         if !self.status()?.is_empty() {
             return Err(VcsError::WorkingCopyDirty);
         }
@@ -637,7 +639,7 @@ impl Client {
         ra.push(&self.repo.root)
     }
 
-    pub fn pull(&self) -> Result<()> {
+    pub fn pull(&self) -> Result<PullOutcome> {
         self.pull_remote()
     }
 

@@ -38,6 +38,17 @@ pub struct MergeOutcome {
     pub conflicts: Vec<String>,
 }
 
+/// Result of integrating a remote HEAD into the working copy.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PullOutcome {
+    /// HEAD revision afterwards.
+    pub head_revision: i64,
+    /// Local commits replayed (and renumbered) on top of the remote history.
+    pub rebased: usize,
+    /// Local commits not yet present on the remote.
+    pub ahead: usize,
+}
+
 /// Which content `resolve` keeps for a text conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveAccept {
@@ -1004,7 +1015,7 @@ impl Repository {
         let outcome = self.apply_tree_delta(
             &self.base_files(&self.wcdb()?)?,
             &target.files,
-            target_rev,
+            Some(&target),
             None,
             true,
             false,
@@ -1190,15 +1201,19 @@ impl Repository {
         } else {
             self.read_commit_by_revision(left_rev)?.files
         };
-        let right = if right_rev == 0 {
-            Vec::new()
+        let right_commit = if right_rev == 0 {
+            None
         } else {
-            self.read_commit_by_revision(right_rev)?.files
+            Some(self.read_commit_by_revision(right_rev)?)
         };
+        let right = right_commit
+            .as_ref()
+            .map(|c| c.files.clone())
+            .unwrap_or_default();
         let outcome = self.apply_tree_delta(
             &left,
             &right,
-            right_rev,
+            right_commit.as_ref(),
             scope_path.as_deref(),
             false,
             dry_run,
@@ -1543,6 +1558,220 @@ impl Repository {
         wcdb.set_meta_value("props_model", "explicit")
     }
 
+    /// Commit ids from `head` back to the root (newest first).
+    fn chain_ids(&self, head: Option<&str>) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut cur = head.map(str::to_owned);
+        while let Some(id) = cur {
+            if out.contains(&id) {
+                return Err(VcsError::Protocol(format!("cycle in history at {id}")));
+            }
+            cur = storage::read_commit(self, &id)?.parent;
+            out.push(id);
+        }
+        Ok(out)
+    }
+
+    /// True when `ancestor` is `descendant` or one of its parents. Merely
+    /// having the object locally is not enough: after an aborted pull the
+    /// remote HEAD can be present without being part of the local history.
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        Ok(self
+            .chain_ids(Some(descendant))?
+            .iter()
+            .any(|id| id == ancestor))
+    }
+
+    /// Bring the local history and working copy to the remote HEAD whose
+    /// objects were already copied in. Local commits that were never pushed
+    /// are replayed on top of it (and renumbered) instead of being dropped;
+    /// if one of them conflicts with the remote changes, nothing is changed.
+    /// The working copy must be clean.
+    pub(crate) fn integrate_remote_head(&self, remote_head: &str) -> Result<PullOutcome> {
+        let _lock = self.lock()?;
+        let remote_chain = self.chain_ids(Some(remote_head))?;
+        let local_chain = self.chain_ids(self.head_commit_id()?.as_deref())?;
+
+        if local_chain.first().is_none_or(|l| remote_chain.contains(l)) {
+            // Fast-forward (or already up to date).
+            self.set_head_commit_id(remote_head)?;
+            self.update_to_revision("HEAD")?;
+            return Ok(PullOutcome {
+                head_revision: self.wcdb()?.head_revision()?,
+                ..PullOutcome::default()
+            });
+        }
+        if let Some(pos) = local_chain.iter().position(|id| id == remote_head) {
+            // Local history already contains the remote: nothing to pull.
+            self.update_to_revision("HEAD")?;
+            return Ok(PullOutcome {
+                head_revision: self.wcdb()?.head_revision()?,
+                ahead: pos,
+                ..PullOutcome::default()
+            });
+        }
+
+        // Diverged: replay the local-only commits onto the remote HEAD.
+        let local_only: Vec<&String> = local_chain
+            .iter()
+            .take_while(|id| !remote_chain.contains(id))
+            .collect();
+        let wcdb = self.wcdb()?;
+        let old_base = self.base_files(&wcdb)?;
+        let mut new_parent = storage::read_commit(self, remote_head)?;
+        for id in local_only.iter().rev() {
+            let local = storage::read_commit(self, id)?;
+            let old_parent_files = match &local.parent {
+                Some(p) => storage::read_commit(self, p)?.files,
+                None => Vec::new(),
+            };
+            new_parent = self.rebase_commit(&local, &old_parent_files, &new_parent)?;
+        }
+
+        // The working copy is clean at the old local HEAD: move it to the new
+        // tip first (BASE still names the old tree), then re-index.
+        self.apply_tree_delta(
+            &old_base,
+            &new_parent.files,
+            Some(&new_parent),
+            None,
+            true,
+            false,
+        )?;
+        self.set_head_commit_id(&new_parent.id)?;
+        self.sync_wcdb()?;
+        Ok(PullOutcome {
+            head_revision: new_parent.revision,
+            rebased: local_only.len(),
+            ahead: local_only.len(),
+        })
+    }
+
+    /// Re-create `commit` (made on top of `old_parent_files`) on top of
+    /// `new_parent`, merging its changes three-way against what the new
+    /// parent changed. Fails without writing anything visible on conflict.
+    fn rebase_commit(
+        &self,
+        commit: &Commit,
+        old_parent_files: &[FileEntry],
+        new_parent: &Commit,
+    ) -> Result<Commit> {
+        let base: BTreeMap<&str, &FileEntry> = old_parent_files
+            .iter()
+            .map(|f| (f.path.as_str(), f))
+            .collect();
+        let theirs: BTreeMap<&str, &FileEntry> =
+            commit.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        let mut result: BTreeMap<String, FileEntry> = new_parent
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.clone()))
+            .collect();
+        let keys: BTreeSet<&str> = base.keys().chain(theirs.keys()).copied().collect();
+        let mut conflicts = Vec::new();
+        for path in keys {
+            let b = base.get(path).copied();
+            let t = theirs.get(path).copied();
+            if !changed_entry(b, t) {
+                continue;
+            }
+            let o = result.get(path).cloned();
+            if !changed_entry(b, o.as_ref()) {
+                match t {
+                    Some(te) => {
+                        result.insert(path.to_owned(), te.clone());
+                    }
+                    None => {
+                        result.remove(path);
+                    }
+                }
+                continue;
+            }
+            if !changed_entry(o.as_ref(), t) {
+                continue;
+            }
+            match (b, o, t) {
+                (Some(be), Some(oe), Some(te))
+                    if !(be.is_binary || oe.is_binary || te.is_binary) =>
+                {
+                    let read = |e: &FileEntry| -> Result<String> {
+                        String::from_utf8(self.read_blob(&e.blob_id)?)
+                            .map_err(|_| VcsError::Protocol(format!("{path} is not UTF-8")))
+                    };
+                    let (text, clean) = three_way_merge_text(&read(be)?, &read(&oe)?, &read(te)?);
+                    let (props, prop_conflicts) = merge_props(&be.props, &oe.props, &te.props);
+                    if !clean || !prop_conflicts.is_empty() {
+                        conflicts.push(path.to_owned());
+                        continue;
+                    }
+                    let mut merged = te.clone();
+                    merged.blob_id = storage::write_blob(self, text.as_bytes())?;
+                    merged.executable = has_svn_prop(&props, "svn:executable");
+                    merged.props = props;
+                    result.insert(path.to_owned(), merged);
+                }
+                _ => conflicts.push(path.to_owned()),
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(VcsError::Diverged {
+                paths: conflicts.join(", "),
+            });
+        }
+
+        let revision = new_parent.revision + 1;
+        let mut files: Vec<FileEntry> = result.into_values().collect();
+        for f in &mut files {
+            if f.copy_from_path.is_some() && theirs.contains_key(f.path.as_str()) {
+                f.copy_from_rev = Some(new_parent.revision);
+            }
+        }
+        let changed = compute_changed_files(Some(&new_parent.files), &files);
+        assign_node_identity(Some(new_parent), &mut files, revision);
+        // Mergeinfo: the new parent's plus whatever this commit added.
+        let mut mergeinfo = new_parent.mergeinfo.clone();
+        let old_parent_mergeinfo = match &commit.parent {
+            Some(p) => storage::read_commit(self, p)?.mergeinfo,
+            None => BTreeMap::new(),
+        };
+        let mut added = Vec::new();
+        for (path, revs) in &commit.mergeinfo {
+            let before: BTreeSet<i64> = old_parent_mergeinfo
+                .get(path)
+                .map(|v| parse_mergeinfo_value(v).into_iter().collect())
+                .unwrap_or_default();
+            for rev in parse_mergeinfo_value(revs) {
+                if !before.contains(&rev) {
+                    added.push((path.clone(), rev));
+                }
+            }
+        }
+        mergeinfo = build_mergeinfo(&added, mergeinfo);
+
+        let rebased = Commit {
+            id: storage::new_commit_id(
+                Some(&new_parent.id),
+                &commit.message,
+                &commit.author,
+                &files,
+            ),
+            revision,
+            parent: Some(new_parent.id.clone()),
+            parent_revision: Some(new_parent.revision),
+            author: commit.author.clone(),
+            message: commit.message.clone(),
+            created_at: commit.created_at,
+            changed_paths: build_changed_paths(Some(new_parent), &changed),
+            changed_files: changed,
+            files,
+            mergeinfo,
+            revprops: commit.revprops.clone(),
+            txn_id: None,
+        };
+        storage::write_commit(self, &rebased)?;
+        Ok(rebased)
+    }
+
     /// Rebuild the revision index (revisions + merge edges) from the parent
     /// chain ending at `head`. Only commits on that chain are indexed, so an
     /// unreferenced object can never shadow a revision number.
@@ -1623,12 +1852,12 @@ impl Repository {
         &self,
         left: &[FileEntry],
         target_files: &[FileEntry],
-        rev: i64,
+        target_meta: Option<&Commit>,
         scope_path: Option<&str>,
         advance_base: bool,
         dry_run: bool,
     ) -> Result<MergeOutcome> {
-        let target_meta = self.read_commit_by_revision(rev).ok();
+        let rev = target_meta.map_or(0, |c| c.revision);
         let wcdb = self.wcdb()?;
         let scope = WcScope::load(&wcdb)?;
         let base_files = left;
@@ -1757,9 +1986,9 @@ impl Repository {
                         te,
                         &raw,
                         &CheckoutMeta {
-                            revision: target_meta.as_ref().map(|c| c.revision),
-                            author: target_meta.as_ref().map(|c| c.author.as_str()),
-                            date: target_meta.as_ref().map(|c| c.created_at),
+                            revision: target_meta.map(|c| c.revision),
+                            author: target_meta.map(|c| c.author.as_str()),
+                            date: target_meta.map(|c| c.created_at),
                             has_lock_token: wcdb.has_lock_token(path)?,
                             inherited: &inherited,
                         },

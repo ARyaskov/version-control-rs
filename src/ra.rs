@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::error::{Result, VcsError};
-use crate::repo::{Repository, VCRS_DIR};
+use crate::repo::{PullOutcome, Repository, VCRS_DIR};
 use crate::types::{BlameLine, ChangeKind, Commit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,7 @@ pub enum WireResponse {
 pub trait RaSession {
     fn capabilities(&self) -> &[Capability];
     fn checkout(&self, dest: &Path) -> Result<()>;
-    fn pull(&self, wc_root: &Path) -> Result<()>;
+    fn pull(&self, wc_root: &Path) -> Result<PullOutcome>;
     fn push(&self, wc_root: &Path) -> Result<()>;
     fn lock(&self, path: &str) -> Result<()>;
     fn unlock(&self, path: &str) -> Result<()>;
@@ -138,10 +138,10 @@ impl RaSession for FileRaSession {
                 username: Some(self.username.clone()),
             },
         )?;
-        self.pull(&repo.root)
+        self.pull(&repo.root).map(|_| ())
     }
 
-    fn pull(&self, wc_root: &Path) -> Result<()> {
+    fn pull(&self, wc_root: &Path) -> Result<PullOutcome> {
         self.authorize(Action::Read, "/")?;
         let local = Repository::discover(wc_root)?;
         let remote = Repository::discover(&self.remote_root)?;
@@ -149,12 +149,13 @@ impl RaSession for FileRaSession {
         let _remote_lock = remote.lock()?;
 
         copy_store(&remote.root, &local.root)?;
-        if let Some(head) = remote.head_commit_id()? {
-            local.set_head_commit_id(&head)?;
-        }
+        let outcome = match remote.head_commit_id()? {
+            // Fast-forwards, or replays unpushed local commits on top.
+            Some(head) => local.integrate_remote_head(&head)?,
+            None => PullOutcome::default(),
+        };
         local.clear_local_lock_tokens()?;
-        local.update_to_revision("HEAD")?;
-        Ok(())
+        Ok(outcome)
     }
 
     fn push(&self, wc_root: &Path) -> Result<()> {
@@ -169,13 +170,12 @@ impl RaSession for FileRaSession {
         let Some(local_head) = local.head_commit_id()? else {
             return Ok(());
         };
+        // Fast-forward only: the remote HEAD must be part of the local
+        // history (having its object locally is not enough).
         if let Some(remote_head) = remote.head_commit_id()?
-            && local.read_commit(&remote_head).is_err()
+            && !local.is_ancestor(&remote_head, &local_head)?
         {
-            return Err(VcsError::OutOfDate {
-                base_rev: local.wcdb_base_rev()?,
-                head_rev: remote.wcdb_head_rev()?,
-            });
+            return Err(VcsError::NonFastForward);
         }
 
         let pending = collect_pending_commits(&local, remote.head_commit_id()?)?;

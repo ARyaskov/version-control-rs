@@ -875,3 +875,70 @@ fn failing_post_commit_hook_does_not_fail_the_commit() {
     assert_eq!(client.commit("r1", "a").unwrap().revision, 1);
     assert!(read(root, ".vcrs/hooks.log").contains("boom"));
 }
+
+fn two_clones(dir: &Path) -> (String, Client, Client) {
+    let srv = dir.join("srv");
+    let server = Client::init(&srv).unwrap();
+    write(&srv, "f.txt", "a\nb\nc\n");
+    add(&server, &["f.txt"]);
+    server.commit("r1", "s").unwrap();
+    let url = format!("file://{}", srv.display());
+    let a = Client::checkout_remote(&url, dir.join("A"), None).unwrap();
+    let b = Client::checkout_remote(&url, dir.join("B"), None).unwrap();
+    (url, a, b)
+}
+
+#[test]
+fn pull_replays_unpushed_local_commits_instead_of_dropping_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_url, a, b) = two_clones(dir.path());
+    write(a.root(), "a.txt", "from A\n");
+    add(&a, &["a.txt"]);
+    a.commit("A r2", "alice").unwrap();
+    a.push().unwrap();
+
+    write(b.root(), "b.txt", "from B\n");
+    add(&b, &["b.txt"]);
+    b.commit("B r2", "bob").unwrap();
+    assert!(b.push().is_err(), "diverged push must be refused");
+
+    let outcome = b.pull().unwrap();
+    assert_eq!(outcome.rebased, 1);
+    let log = b.log(10).unwrap();
+    let messages: Vec<&str> = log.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(messages, vec!["B r2", "A r2", "r1"]);
+    assert_eq!(log[0].revision, 3);
+    assert_eq!(read(b.root(), "a.txt"), "from A\n");
+    assert_eq!(read(b.root(), "b.txt"), "from B\n");
+    assert!(b.status().unwrap().is_empty());
+
+    b.push().unwrap();
+    a.pull().unwrap();
+    assert_eq!(read(a.root(), "b.txt"), "from B\n");
+    assert_eq!(a.log(10).unwrap().len(), 3);
+}
+
+#[test]
+fn conflicting_pull_changes_nothing_and_push_stays_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_url, a, b) = two_clones(dir.path());
+    write(a.root(), "f.txt", "a\nA\nc\n");
+    a.commit("A edit", "alice").unwrap();
+    a.push().unwrap();
+
+    write(b.root(), "f.txt", "a\nB\nc\n");
+    let b_commit = b.commit("B edit", "bob").unwrap();
+    let err = b.pull().unwrap_err();
+    assert!(
+        matches!(err, version_control_rs::VcsError::Diverged { .. }),
+        "{err}"
+    );
+    assert_eq!(b.log(10).unwrap()[0].id, b_commit.id);
+    assert_eq!(read(b.root(), "f.txt"), "a\nB\nc\n");
+
+    // The remote HEAD object was fetched, but it is not an ancestor: pushing
+    // must not overwrite the remote history.
+    assert!(b.push().is_err());
+    let srv = Client::discover(dir.path().join("srv")).unwrap();
+    assert_eq!(srv.log(1).unwrap()[0].message, "A edit");
+}

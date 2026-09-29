@@ -436,11 +436,19 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Pull => {
             let client = Client::discover(".")?;
-            client.pull_remote()?;
+            let outcome = client.pull_remote()?;
             if json_output {
-                print_json(json!({"ok": true, "command": "pull"}))?;
+                print_json(json!({"ok": true, "command": "pull", "outcome": outcome}))?;
             } else {
-                println!("Updated from remote");
+                println!("Updated from remote to r{}", outcome.head_revision);
+                if outcome.rebased > 0 {
+                    println!(
+                        "Replayed {} local commit(s) on top of the remote history; push to publish",
+                        outcome.rebased
+                    );
+                } else if outcome.ahead > 0 {
+                    println!("{} local commit(s) not pushed yet", outcome.ahead);
+                }
             }
         }
         Commands::Push => {

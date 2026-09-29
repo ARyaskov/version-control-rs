@@ -14,6 +14,10 @@ pub enum VcsError {
     Protocol(String),
     #[error("working copy is out of date: base r{base_rev}, head r{head_rev}")]
     OutOfDate { base_rev: i64, head_rev: i64 },
+    #[error("push rejected: the remote has commits missing from local history; pull first")]
+    NonFastForward,
+    #[error("local commits conflict with remote changes in: {paths}; nothing was changed")]
+    Diverged { paths: String },
     #[error("working copy has local modifications; commit/revert before this operation")]
     WorkingCopyDirty,
     #[error("tree conflict at '{path}': {reason}")]
