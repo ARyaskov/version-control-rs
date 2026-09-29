@@ -24,6 +24,9 @@ pub(crate) const VCRS_DIR: &str = ".vcrs";
 #[derive(Debug, Clone)]
 pub struct Repository {
     pub root: PathBuf,
+    /// Whether `.vcrs/hooks/*` scripts are executed. Enabled for a local
+    /// working copy; the HTTP server disables them unless explicitly asked.
+    hooks_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,7 @@ impl Repository {
             if dir.join(VCRS_DIR).is_dir() {
                 let repo = Self {
                     root: dir.to_path_buf(),
+                    hooks_enabled: true,
                 };
                 repo.ensure_initialized()?;
                 return Ok(repo);
@@ -70,7 +74,10 @@ impl Repository {
             fs::canonicalize(path)?
         };
 
-        let repo = Self { root };
+        let repo = Self {
+            root,
+            hooks_enabled: true,
+        };
         storage::ensure_layout(&repo)?;
         repo.ensure_initialized()?;
         Ok(repo)
@@ -88,6 +95,11 @@ impl Repository {
             self.sync_wcdb()?;
         }
         Ok(())
+    }
+
+    /// Enable or disable execution of repository hook scripts.
+    pub fn set_hooks_enabled(&mut self, enabled: bool) {
+        self.hooks_enabled = enabled;
     }
 
     /// Resolve a repository-relative path under the working-copy root, refusing
@@ -1318,13 +1330,20 @@ impl Repository {
     }
 
     fn run_hook(&self, hook_name: &str, args: &[&str]) -> Result<()> {
+        if !self.hooks_enabled {
+            return Ok(());
+        }
         let hooks = self.root.join(VCRS_DIR).join("hooks");
         let candidates = [
             hooks.join(hook_name),
             hooks.join(format!("{hook_name}.sh")),
             hooks.join(format!("{hook_name}.ps1")),
         ];
-        let Some(path) = candidates.iter().find(|p| p.exists()) else {
+        // Only a regular file counts: a symlink could point anywhere.
+        let Some(path) = candidates
+            .iter()
+            .find(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+        else {
             return Ok(());
         };
         let ext = path

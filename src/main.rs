@@ -272,6 +272,9 @@ struct ServeHttpArgs {
     host: String,
     #[arg(long, default_value_t = 3690)]
     port: u16,
+    /// Execute `.vcrs/hooks` scripts for commits received over HTTP.
+    #[arg(long)]
+    enable_hooks: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1039,7 +1042,10 @@ fn run(cli: Cli) -> Result<()> {
                 );
                 println!("SVN/DAV compatibility is partial (read/discovery/report foundation).");
             }
-            version_control_rs::svn_http::serve_http(args.repo, &bind)?;
+            let options = version_control_rs::svn_http::ServeOptions {
+                enable_hooks: args.enable_hooks,
+            };
+            version_control_rs::svn_http::serve_http(args.repo, &bind, options)?;
         }
     }
 

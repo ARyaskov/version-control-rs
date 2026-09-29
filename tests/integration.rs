@@ -244,3 +244,21 @@ fn update_does_not_follow_dangling_symlink() {
     let _ = client.update_to_revision("HEAD");
     assert!(!outside.exists(), "write must not follow the symlink");
 }
+
+#[cfg(unix)]
+#[test]
+fn hooks_can_be_disabled() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = Client::init(root).unwrap();
+    let hook = root.join(".vcrs/hooks/pre-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\necho rejected >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    write(root, "a.txt", "a\n");
+    assert!(client.commit("r1", "a").is_err(), "enabled hook rejects");
+    let client = client.with_hooks(false);
+    assert_eq!(client.commit("r1", "a").unwrap().revision, 1);
+}

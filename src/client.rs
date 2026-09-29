@@ -62,6 +62,13 @@ impl Client {
         Ok(Self { repo })
     }
 
+    /// Enable or disable execution of `.vcrs/hooks` scripts for operations
+    /// performed through this client.
+    pub fn with_hooks(mut self, enabled: bool) -> Self {
+        self.repo.set_hooks_enabled(enabled);
+        self
+    }
+
     pub fn root(&self) -> &Path {
         &self.repo.root
     }

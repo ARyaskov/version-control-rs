@@ -25,9 +25,18 @@ const MAX_ACTIVITY_BYTES: usize = 128 * 1024 * 1024;
 /// HTTP Basic auth realm advertised when a password file is configured.
 const AUTH_REALM: &str = "vcrs";
 
+/// Server behaviour switches (all default to the safe choice).
+#[derive(Debug, Clone, Default)]
+pub struct ServeOptions {
+    /// Run `.vcrs/hooks` scripts on commits received over HTTP. Off by default:
+    /// hook execution on a network-facing server must be an explicit decision.
+    pub enable_hooks: bool,
+}
+
 #[derive(Debug)]
 struct AppState {
     repo_root: PathBuf,
+    options: ServeOptions,
     activities: Mutex<HashMap<String, TxnActivity>>,
     /// Serializes commit application so overlapping MERGE requests cannot
     /// interleave writes to the shared working copy.
@@ -43,7 +52,7 @@ struct TxnActivity {
     deletes: BTreeSet<String>,
 }
 
-pub fn serve_http(repo_root: PathBuf, bind: &str) -> Result<()> {
+pub fn serve_http(repo_root: PathBuf, bind: &str, options: ServeOptions) -> Result<()> {
     if !repo_root.join(".vcrs").exists() {
         return Err(VcsError::RepositoryNotFound);
     }
@@ -58,6 +67,7 @@ pub fn serve_http(repo_root: PathBuf, bind: &str) -> Result<()> {
 
     let data = web::Data::new(AppState {
         repo_root,
+        options,
         activities: Mutex::new(HashMap::new()),
         commit_lock: Mutex::new(()),
     });
@@ -292,12 +302,13 @@ async fn svn_entry(req: HttpRequest, body: web::Bytes, state: web::Data<AppState
             // commits so concurrent MERGEs cannot interleave working-copy writes.
             let state = state.clone();
             let repo_root = state.repo_root.clone();
+            let hooks = state.options.enable_hooks;
             let outcome = web::block(move || {
                 let _guard = state
                     .commit_lock
                     .lock()
                     .map_err(|_| VcsError::RepositoryNotFound)?;
-                apply_activity_commit(&repo_root, activity, log_msg)
+                apply_activity_commit(&repo_root, activity, log_msg, hooks)
             })
             .await;
             match outcome {
@@ -427,8 +438,9 @@ fn apply_activity_commit(
     repo_root: &Path,
     activity: TxnActivity,
     log_message: Option<String>,
+    hooks: bool,
 ) -> Result<i64> {
-    let client = Client::discover(repo_root)?;
+    let client = Client::discover(repo_root)?.with_hooks(hooks);
     if !client.status()?.is_empty() {
         return Err(VcsError::WorkingCopyDirty);
     }
@@ -639,22 +651,7 @@ fn save_locks(path: &Path, locks: &BTreeMap<String, String>) -> Result<()> {
 }
 
 fn join_repo_path(repo_root: &Path, rel: &str) -> Result<PathBuf> {
-    use std::path::Component;
-    let mut out = repo_root.to_path_buf();
-    for part in rel.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        // Defense in depth: only push plain filename components. This rejects
-        // "..", drive prefixes ("C:"), root/UNC prefixes, etc. — anything that
-        // PathBuf::push would treat as absolute and use to escape repo_root.
-        let mut comps = Path::new(part).components();
-        match (comps.next(), comps.next()) {
-            (Some(Component::Normal(_)), None) => out.push(part),
-            _ => return Err(VcsError::PathOutsideRepository(rel.to_owned())),
-        }
-    }
-    Ok(out)
+    crate::path::safe_join(repo_root, rel)
 }
 
 fn sanitize_repo_rel(input: &str) -> Result<String> {
@@ -663,18 +660,19 @@ fn sanitize_repo_rel(input: &str) -> Result<String> {
     // letter past the checks.
     let decoded = percent_decode(input);
     let norm = decoded.trim().trim_matches('/').replace('\\', "/");
-    if norm.is_empty() {
+    if norm.is_empty() || norm.starts_with("!svn") {
         return Err(VcsError::PathOutsideRepository(input.to_owned()));
     }
-    if norm.starts_with(".vcrs") || norm.starts_with("!svn") {
+    // Any ':' is refused over the wire regardless of the server platform, so a
+    // repository served from Linux never accumulates names a Windows client
+    // cannot check out (drive prefixes, NTFS streams).
+    if norm.contains(':') {
         return Err(VcsError::PathOutsideRepository(input.to_owned()));
     }
-    // Reject "..", and any ':' (Windows drive prefix like "C:" / "C:foo" or an
-    // NTFS alternate-data-stream) — on Windows PathBuf::push of a drive-prefixed
-    // component silently discards the repo root and escapes the sandbox.
-    if norm.split('/').any(|p| p == ".." || p.contains(':')) {
-        return Err(VcsError::PathOutsideRepository(input.to_owned()));
-    }
+    // The shared validator rejects "..", empty components and metadata
+    // directories case-insensitively (".VCRS" is ".vcrs" on macOS/Windows),
+    // including Windows trailing-dot/space and 8.3 aliases.
+    crate::path::validate_rel_path(&norm)?;
     Ok(norm)
 }
 
@@ -1434,6 +1432,24 @@ mod tests {
         assert!(sanitize_repo_rel("file:stream").is_err());
         // A normal nested path still works.
         assert_eq!(sanitize_repo_rel("a/b/c.txt").unwrap(), "a/b/c.txt");
+    }
+
+    #[test]
+    fn sanitize_blocks_metadata_directories_in_any_case() {
+        for bad in [
+            ".vcrs/hooks/pre-commit",
+            ".VCRS/hooks/pre-commit",
+            ".Vcrs./hooks/x",
+            "%2eVCRS/x",
+            "sub/.vcrs/x",
+            ".git/hooks/post-checkout",
+            ".GIT/config",
+            "VCRS~1/x",
+        ] {
+            assert!(sanitize_repo_rel(bad).is_err(), "{bad} must be rejected");
+        }
+        // Ordinary dot-files that merely start with the name stay allowed.
+        assert_eq!(sanitize_repo_rel(".vcrsignore").unwrap(), ".vcrsignore");
     }
 
     #[test]
