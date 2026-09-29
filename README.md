@@ -65,7 +65,9 @@ vcrs blame src/main.rs -r 7
 
 vcrs update -r HEAD
 vcrs revert [optional/path ...]
-vcrs merge -r 7 [--dry-run] [--record-only]
+vcrs merge -r 7 [--dry-run] [--record-only]   # cherry-pick the change made by r7
+vcrs merge -r 3:7                             # apply the changes from r3 to r7
+vcrs merge -r 7:6                             # undo r7
 vcrs resolve src/main.rs [--accept working|mine-full|theirs-full|base]
 vcrs lock path/to/file
 vcrs unlock path/to/file

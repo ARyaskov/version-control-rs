@@ -583,3 +583,57 @@ fn non_overlapping_edits_merge_cleanly_on_update() {
     assert_eq!(st.len(), 1);
     assert!(!st[0].conflicted);
 }
+
+fn merge_fixture(root: &Path) -> Client {
+    let client = Client::init(root).unwrap();
+    write(root, "f.txt", "1\n");
+    add(&client, &["f.txt"]);
+    client.commit("r1", "a").unwrap();
+    write(root, "f.txt", "2\n");
+    client.commit("r2", "a").unwrap();
+    write(root, "g.txt", "g\n");
+    add(&client, &["g.txt"]);
+    client.commit("r3", "a").unwrap();
+    client
+}
+
+#[test]
+fn merging_an_old_revision_does_not_revert_newer_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = merge_fixture(root);
+    // r2 is already part of BASE (r3): merging it again is a no-op, and in
+    // particular must not delete g.txt that was added later.
+    let outcome = client.merge("2", false, false).unwrap();
+    assert!(outcome.conflicts.is_empty());
+    assert!(root.join("g.txt").exists());
+    assert!(client.status().unwrap().is_empty());
+}
+
+#[test]
+fn merge_cherry_picks_the_delta_of_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = merge_fixture(root);
+    write(root, "f.txt", "1\n");
+    client.commit("r4 revert f", "a").unwrap();
+
+    client.merge("2", false, false).unwrap();
+    assert_eq!(read(root, "f.txt"), "2\n");
+    assert!(root.join("g.txt").exists());
+    let c5 = client.commit("r5 re-apply r2", "a").unwrap();
+    assert_eq!(c5.mergeinfo.get("/").map(String::as_str), Some("2"));
+}
+
+#[test]
+fn reverse_range_merge_undoes_a_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let client = merge_fixture(root);
+    client.merge("3:2", false, false).unwrap();
+    assert!(!root.join("g.txt").exists());
+    let st = client.status().unwrap();
+    assert_eq!(st.len(), 1);
+    assert_eq!(st[0].path, "g.txt");
+    assert_eq!(st[0].kind, ChangeKind::Deleted);
+}

@@ -991,8 +991,14 @@ impl Repository {
         }
         let target_rev = self.resolve_revision_spec(revision)?;
         let target = self.read_commit_by_revision(target_rev)?;
-        let outcome =
-            self.apply_revision_with_conflicts(target_rev, &target.files, None, true, false)?;
+        let outcome = self.apply_tree_delta(
+            &self.base_files(&self.wcdb()?)?,
+            &target.files,
+            target_rev,
+            None,
+            true,
+            false,
+        )?;
         if depth.is_some() {
             self.prune_working_to_depth()?;
         }
@@ -1137,6 +1143,12 @@ impl Repository {
         Ok(())
     }
 
+    /// Merge the change(s) named by `revision` into the working copy:
+    /// `N` is the change made by rN (the delta rN-1 -> rN, i.e. a
+    /// cherry-pick), `A:B` the delta from rA to rB (`B:A` with B > A undoes
+    /// it); either may be prefixed with `path@` to limit the merge scope.
+    /// The result is a local modification to commit; mergeinfo for the merged
+    /// revisions is recorded with that commit.
     pub fn merge_from_revision(
         &self,
         revision: &str,
@@ -1144,55 +1156,84 @@ impl Repository {
         record_only: bool,
     ) -> Result<MergeOutcome> {
         let _lock = self.lock()?;
-        let (scope_path, target_rev) = self.resolve_peg_spec(revision)?;
-        let target = self.read_commit_by_revision(target_rev)?;
+        let (scope_path, left_rev, right_rev) = self.resolve_merge_spec(revision)?;
+        let scope = scope_path.as_deref().unwrap_or("/").to_owned();
+        // Only forward merges add mergeinfo; undoing a change records nothing.
+        let merged_revs: Vec<i64> = (left_rev + 1..=right_rev).collect();
 
         if record_only {
             // A dry run must not persist anything, even with --record-only.
-            if dry_run {
-                return Ok(MergeOutcome {
-                    changed: Vec::new(),
-                    conflicts: Vec::new(),
-                });
+            if !dry_run {
+                let wcdb = self.wcdb()?;
+                for rev in &merged_revs {
+                    wcdb.add_pending_merge(&scope, *rev)?;
+                }
             }
-            let mut work = BTreeMap::new();
-            work.insert("record-only".to_owned(), target_rev.to_string());
-            self.wcdb()?.enqueue_work(&serde_json::to_string(&work)?)?;
-            self.wcdb()?
-                .add_pending_merge(scope_path.as_deref().unwrap_or("/"), target_rev)?;
             return Ok(MergeOutcome {
                 changed: Vec::new(),
                 conflicts: Vec::new(),
             });
         }
 
-        if dry_run {
-            // Report what the merge would actually do (incoming ops + conflicts),
-            // not the unrelated local working-copy status.
-            return self.apply_revision_with_conflicts(
-                target_rev,
-                &target.files,
-                scope_path.as_deref(),
-                false,
-                true,
-            );
-        }
-
-        let outcome = self.apply_revision_with_conflicts(
-            target_rev,
-            &target.files,
+        let left = if left_rev == 0 {
+            Vec::new()
+        } else {
+            self.read_commit_by_revision(left_rev)?.files
+        };
+        let right = if right_rev == 0 {
+            Vec::new()
+        } else {
+            self.read_commit_by_revision(right_rev)?.files
+        };
+        let outcome = self.apply_tree_delta(
+            &left,
+            &right,
+            right_rev,
             scope_path.as_deref(),
             false,
-            false,
+            dry_run,
         )?;
+        if dry_run {
+            return Ok(outcome);
+        }
         // Only record mergeinfo when the merge applied cleanly; a conflicted
         // merge is not yet integrated and must be resolved + re-evaluated.
         if outcome.conflicts.is_empty() {
-            self.wcdb()?
-                .add_pending_merge(scope_path.as_deref().unwrap_or("/"), target_rev)?;
+            let wcdb = self.wcdb()?;
+            for rev in &merged_revs {
+                wcdb.add_pending_merge(&scope, *rev)?;
+            }
         }
         self.sync_wcdb()?;
         Ok(outcome)
+    }
+
+    /// Parse a merge source into `(scope path, left revision, right revision)`.
+    fn resolve_merge_spec(&self, spec: &str) -> Result<(Option<String>, i64, i64)> {
+        let (path, revs) = match split_peg(spec) {
+            Some((path, revs)) => (Some(path.to_owned()), revs),
+            None => (None, spec),
+        };
+        let rev_or_zero = |s: &str| -> Result<i64> {
+            if s.trim() == "0" {
+                Ok(0)
+            } else {
+                self.resolve_revision_spec(s)
+            }
+        };
+        let (left, right) = match revs.split_once(':') {
+            Some((a, b)) => (rev_or_zero(a)?, rev_or_zero(b)?),
+            None => {
+                let n = self.resolve_revision_spec(revs)?;
+                (n - 1, n)
+            }
+        };
+        if left == right {
+            return Err(VcsError::RevisionNotFound(format!(
+                "empty merge range '{spec}'"
+            )));
+        }
+        Ok((path, left, right))
     }
 
     pub fn resolve_revision_spec(&self, spec: &str) -> Result<i64> {
@@ -1543,10 +1584,17 @@ impl Repository {
         Ok(())
     }
 
-    fn apply_revision_with_conflicts(
+    /// Apply the change from tree `left` to tree `right` to the working copy,
+    /// three-way against local modifications.
+    /// - update: `left` is BASE; afterwards BASE becomes `rev` (`advance_base`);
+    /// - merge: `left`/`right` are the merge-source revisions; BASE stays and
+    ///   the result is a local modification whose additions and deletions are
+    ///   scheduled for the next commit.
+    fn apply_tree_delta(
         &self,
-        rev: i64,
+        left: &[FileEntry],
         target_files: &[FileEntry],
+        rev: i64,
         scope_path: Option<&str>,
         advance_base: bool,
         dry_run: bool,
@@ -1554,7 +1602,10 @@ impl Repository {
         let target_meta = self.read_commit_by_revision(rev).ok();
         let wcdb = self.wcdb()?;
         let scope = WcScope::load(&wcdb)?;
-        let base_files = self.base_files(&wcdb)?;
+        let base_files = left;
+        let actual_base = self.base_files(&wcdb)?;
+        let base_paths: BTreeSet<&str> = actual_base.iter().map(|f| f.path.as_str()).collect();
+        let versioned = versioned_paths(&actual_base, &wcdb.schedule()?);
         let working = self.snapshot_working_copy()?;
 
         let base_map: BTreeMap<&str, &FileEntry> =
@@ -1653,9 +1704,14 @@ impl Repository {
             // A merge changes the working copy relative to BASE, so additions
             // and deletions it brings are scheduled for the next commit.
             if !advance_base {
-                match (b, t) {
-                    (None, Some(_)) => wcdb.set_schedule(path, ScheduleOp::Add, None)?,
-                    (Some(_), None) => wcdb.set_schedule(path, ScheduleOp::Delete, None)?,
+                match t {
+                    Some(_) if !versioned.contains(*path) => {
+                        wcdb.set_schedule(path, ScheduleOp::Add, None)?;
+                    }
+                    None if base_paths.contains(*path) => {
+                        wcdb.set_schedule(path, ScheduleOp::Delete, None)?;
+                    }
+                    None => wcdb.clear_schedule(&[path.to_string()])?,
                     _ => {}
                 }
             }

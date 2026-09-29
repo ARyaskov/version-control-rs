@@ -173,6 +173,8 @@ struct ChangedArgs {
 
 #[derive(Args, Debug)]
 struct MergeArgs {
+    /// `N` merges the change made by rN (cherry-pick), `A:B` the changes from
+    /// rA to rB (`B:A` undoes them); prefix with `path@` to limit the scope.
     #[arg(short = 'r', long)]
     revision: String,
     #[arg(long)]
